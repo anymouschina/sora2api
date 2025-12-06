@@ -396,10 +396,10 @@ class SoraClient:
         share_url = f"https://sora.chatgpt.com/p/{post_id}"
 
         # Prepare request
-        json_data = {
-            "url": share_url,
-            "token": parse_token
-        }
+        json_data = {"url": share_url}
+        # Only include token when provided (内部解析需要 token，第三方如 sorai.me 则不需要)
+        if parse_token:
+            json_data["token"] = parse_token
 
         kwargs = {
             "json": json_data,

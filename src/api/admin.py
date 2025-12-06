@@ -87,7 +87,15 @@ class UpdateTokenRequest(BaseModel):
     image_concurrency: Optional[int] = None  # Image concurrency limit
     video_concurrency: Optional[int] = None  # Video concurrency limit
 
+class ImportTokensRequest(BaseModel):
+    # Use a generic dict here so we can support multiple input formats
+    # (exported tokens from this system and raw session JSON objects).
+    tokens: List[dict]
+
+
 class ImportTokenItem(BaseModel):
+    """Canonical token import format used internally."""
+
     email: str  # Email (primary key)
     access_token: str  # Access Token (AT)
     session_token: Optional[str] = None  # Session Token (ST)
@@ -98,8 +106,65 @@ class ImportTokenItem(BaseModel):
     image_concurrency: int = -1  # Image concurrency limit
     video_concurrency: int = -1  # Video concurrency limit
 
-class ImportTokensRequest(BaseModel):
-    tokens: List[ImportTokenItem]
+
+def _normalize_import_item(raw: dict) -> ImportTokenItem:
+    """Normalize various token JSON formats into ImportTokenItem.
+
+    Supported formats:
+    1) Exported token format from this system:
+       {
+         "email": "...",
+         "access_token": "...",
+         "session_token": "...",
+         "refresh_token": "...",
+         "is_active": true,
+         ...
+       }
+    2) Raw session JSON like:
+       {
+         "user": { "email": "..." },
+         "expires": "...",
+         "accessToken": "...",
+         "internalApiBase": null
+       }
+    """
+    # Email
+    email = raw.get("email")
+    if not email and isinstance(raw.get("user"), dict):
+        email = raw.get("user", {}).get("email")
+
+    if not email:
+        raise ValueError("Missing email field in token item")
+
+    # Access token
+    access_token = (
+        raw.get("access_token")
+        or raw.get("accessToken")
+        or raw.get("token")
+    )
+    if not access_token:
+        raise ValueError("Missing access_token/accessToken field in token item")
+
+    # Other optional fields
+    session_token = raw.get("session_token")
+    refresh_token = raw.get("refresh_token")
+    is_active = raw.get("is_active", True)
+    image_enabled = raw.get("image_enabled", True)
+    video_enabled = raw.get("video_enabled", True)
+    image_concurrency = raw.get("image_concurrency", -1)
+    video_concurrency = raw.get("video_concurrency", -1)
+
+    return ImportTokenItem(
+        email=email,
+        access_token=access_token,
+        session_token=session_token,
+        refresh_token=refresh_token,
+        is_active=is_active,
+        image_enabled=image_enabled,
+        video_enabled=video_enabled,
+        image_concurrency=image_concurrency,
+        video_concurrency=video_concurrency,
+    )
 
 class UpdateAdminConfigRequest(BaseModel):
     error_ban_threshold: int
@@ -340,7 +405,13 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
         added_count = 0
         updated_count = 0
 
-        for import_item in request.tokens:
+        for raw_item in request.tokens:
+            # Normalize raw JSON to canonical ImportTokenItem
+            try:
+                import_item = _normalize_import_item(raw_item)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
             # Check if token with this email already exists
             existing_token = await db.get_token_by_email(import_item.email)
 

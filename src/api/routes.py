@@ -1,12 +1,13 @@
 """API routes - OpenAI compatible endpoints"""
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Path
 from fastapi.responses import StreamingResponse, JSONResponse
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 import json
 import re
 from ..core.auth import verify_api_key_header
-from ..core.models import ChatCompletionRequest
+from ..core.models import ChatCompletionRequest, Task as DbTask
+from ..core.database import Database
 from ..services.generation_handler import GenerationHandler, MODEL_CONFIG
 
 router = APIRouter()
@@ -64,6 +65,119 @@ async def list_models(api_key: str = Depends(verify_api_key_header)):
     return {
         "object": "list",
         "data": models
+    }
+
+@router.post("/v1/video/tasks")
+async def create_video_task(
+    body: dict,
+    api_key: str = Depends(verify_api_key_header),
+):
+    """
+    Create a video generation task (non-streaming).
+
+    Expected payload:
+    {
+      "model": "sora-video-landscape-10s",
+      "prompt": "...",
+      "durationSeconds": 10,
+      "orientation": "landscape"
+    }
+    """
+    if generation_handler is None:
+        raise HTTPException(status_code=500, detail="Generation handler not initialized")
+
+    model = body.get("model")
+    prompt = body.get("prompt") or ""
+    if not model or not isinstance(model, str):
+        raise HTTPException(status_code=400, detail="model is required")
+    if model not in MODEL_CONFIG:
+        raise HTTPException(status_code=400, detail=f"Invalid model: {model}")
+    if MODEL_CONFIG[model]["type"] != "video":
+        raise HTTPException(status_code=400, detail="Only video models are supported by this endpoint")
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    # 当前 durationSeconds/orientation 主要由 model 决定；保持参数兼容但暂不细化控制
+    try:
+        task_id = await generation_handler.create_video_task(model=model, prompt=prompt)
+        return {
+            "id": task_id,
+            "status": "running",
+            "progress": 0,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/v1/video/tasks/{task_id}")
+async def get_video_task(
+    task_id: str = Path(..., description="Sora video task id"),
+    api_key: str = Depends(verify_api_key_header),
+):
+    """Query video task status and result by task id."""
+    if generation_handler is None:
+        raise HTTPException(status_code=500, detail="Generation handler not initialized")
+
+    db: Database = generation_handler.db  # type: ignore[attr-defined]
+    task: Optional[DbTask] = await db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # 优先拉取上游最新进度并同步至 DB（完成/失败状态仍由后台轮询决定）
+    upstream = None
+    upstream_raw = None
+    try:
+        task, pending = await generation_handler.refresh_video_task_progress(task)  # type: ignore[arg-type]
+        if pending:
+            # 只挑选一部分关键字段作为上游可见信息
+            upstream = {
+                "status": pending.get("status"),
+                "progress_pct": pending.get("progress_pct"),
+                "progress_pos_in_queue": pending.get("progress_pos_in_queue"),
+                "estimated_queue_wait_time": pending.get("estimated_queue_wait_time"),
+                "queue_status_message": pending.get("queue_status_message"),
+                "priority": pending.get("priority"),
+            }
+            # 同时保留完整的 pending 原始数据，便于排查问题
+            upstream_raw = pending
+    except Exception:
+        # 刷新失败时不影响原有逻辑，继续使用 DB 中的状态
+        pass
+
+    # Map internal status to external
+    raw_status = (task.status or "").lower()
+    if raw_status in ["completed", "succeeded"]:
+        status = "succeeded"
+    elif raw_status in ["failed", "error"]:
+        status = "failed"
+    elif raw_status in ["processing", "running"]:
+        status = "running"
+    else:
+        status = "running"
+
+    progress = int((task.progress or 0) * 100) if task.progress is not None and task.progress <= 1 else int(task.progress or 0)
+    progress = max(0, min(progress, 100))
+
+    video_url = None
+    thumbnail_url = None
+    content = None
+    if task.result_urls:
+        try:
+            urls = json.loads(task.result_urls)
+            if isinstance(urls, list) and urls:
+                video_url = urls[0]
+        except Exception:
+            pass
+
+    return {
+        "id": task.task_id,
+        "status": status,
+        "progress": progress,
+        "video_url": video_url,
+        "thumbnail_url": thumbnail_url,
+        "content": content,
+        "error": task.error_message,
+        "upstream": upstream,
+        "upstream_raw": upstream_raw,
     }
 
 @router.post("/v1/chat/completions")

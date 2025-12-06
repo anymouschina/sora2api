@@ -17,6 +17,7 @@ from .services.generation_handler import GenerationHandler
 from .services.concurrency_manager import ConcurrencyManager
 from .api import routes as api_routes
 from .api import admin as admin_routes
+from .api import downloader as downloader_routes
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -46,10 +47,12 @@ generation_handler = GenerationHandler(sora_client, token_manager, load_balancer
 # Set dependencies for route modules
 api_routes.set_generation_handler(generation_handler)
 admin_routes.set_dependencies(token_manager, proxy_manager, db, generation_handler, concurrency_manager)
+downloader_routes.set_dependencies(token_manager, proxy_manager)
 
 # Include routers
 app.include_router(api_routes.router)
 app.include_router(admin_routes.router)
+app.include_router(downloader_routes.router)
 
 # Static files
 static_dir = Path(__file__).parent.parent / "static"

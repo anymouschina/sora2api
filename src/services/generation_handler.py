@@ -5,6 +5,7 @@ import base64
 import time
 import random
 import re
+import os
 from typing import Optional, AsyncGenerator, Dict, Any
 from datetime import datetime
 from .sora_client import SoraClient
@@ -84,6 +85,110 @@ class GenerationHandler:
             default_timeout=config.cache_timeout,
             proxy_manager=proxy_manager
         )
+
+    async def create_video_task(self, model: str, prompt: str) -> str:
+        """Create a video generation task and poll it in background.
+
+        面向 TapCanvas 这类上游：返回 taskId，前端只需轮询本服务的
+        /v1/video/tasks/{id} 即可获得进度和最终视频 URL，无需维持 SSE 长连接。
+        """
+        if model not in MODEL_CONFIG:
+            raise ValueError(f"Invalid model: {model}")
+
+        model_config = MODEL_CONFIG[model]
+        if model_config.get("type") != "video":
+            raise ValueError("create_video_task only supports video models")
+
+        # Select token for video generation
+        token_obj = await self.load_balancer.select_token(for_image_generation=False, for_video_generation=True)
+        if not token_obj:
+            raise Exception(
+                "No available tokens for video generation. All tokens are either disabled, cooling down, "
+                "Sora2 quota exhausted, don't support Sora2, or expired."
+            )
+
+        # Acquire concurrency slot for video generation
+        if self.concurrency_manager:
+            concurrency_acquired = await self.concurrency_manager.acquire_video(token_obj.id)
+            if not concurrency_acquired:
+                raise Exception(f"Failed to acquire concurrency slot for token {token_obj.id}")
+
+        task_id: Optional[str] = None
+        try:
+            # Determine number of frames and orientation from model config
+            n_frames = model_config.get("n_frames", 300)
+            orientation = model_config.get("orientation", "landscape")
+
+            # Storyboard vs normal prompt
+            if self.sora_client.is_storyboard_prompt(prompt):
+                formatted_prompt = self.sora_client.format_storyboard_prompt(prompt)
+                debug_logger.log_info(f"[video-task] Storyboard mode. Formatted prompt: {formatted_prompt}")
+                task_id = await self.sora_client.generate_storyboard(
+                    formatted_prompt,
+                    token_obj.token,
+                    orientation=orientation,
+                    media_id=None,
+                    n_frames=n_frames,
+                )
+            else:
+                task_id = await self.sora_client.generate_video(
+                    prompt,
+                    token_obj.token,
+                    orientation=orientation,
+                    media_id=None,
+                    n_frames=n_frames,
+                )
+
+            if not task_id:
+                raise Exception("Upstream did not return task id")
+
+            # Persist task
+            task = Task(
+                task_id=task_id,
+                token_id=token_obj.id,
+                model=model,
+                prompt=prompt,
+                status="processing",
+                progress=0.0,
+            )
+            await self.db.create_task(task)
+
+            # Record usage
+            await self.token_manager.record_usage(token_obj.id, is_video=True)
+
+            # Launch background poller (no SSE, 仅更新数据库和内部状态)
+            async def _runner():
+                try:
+                    async for _ in self._poll_task_result(
+                        task_id,
+                        token_obj.token,
+                        True,
+                        False,  # stream=False → 不写 SSE，只更新任务表
+                        prompt,
+                        token_obj.id,
+                    ):
+                        # chunks 用于 SSE，这里忽略即可
+                        pass
+                    await self.token_manager.record_success(token_obj.id, is_video=True)
+                except Exception as e:
+                    await self.token_manager.record_error(token_obj.id)
+                    debug_logger.log_error(
+                        error_message=f"[video-task] Background polling failed for task {task_id}: {str(e)}",
+                        status_code=500,
+                        response_text=str(e),
+                    )
+                finally:
+                    if self.concurrency_manager:
+                        await self.concurrency_manager.release_video(token_obj.id)
+
+            asyncio.create_task(_runner())
+
+            return task_id
+        except Exception:
+            # Release concurrency slot if creation itself fails
+            if self.concurrency_manager:
+                await self.concurrency_manager.release_video(token_obj.id)
+            raise
 
     def _get_base_url(self) -> str:
         """Get base URL for cache files"""
@@ -459,6 +564,10 @@ class GenerationHandler:
 
         debug_logger.log_info(f"Starting task polling: task_id={task_id}, is_video={is_video}, timeout={timeout}s, max_attempts={max_attempts}")
 
+        # 标记是否拿到过来自 Sora 官方的真实进度（progress_pct）
+        # 若始终拿不到，则使用时间维度估算进度，避免上游一直显示 0% 到 100%。
+        has_real_progress = False
+
         # Check and log watermark-free mode status at the beginning
         if is_video:
             watermark_free_config = await self.db.get_watermark_free_config()
@@ -503,16 +612,41 @@ class GenerationHandler:
                     for task in pending_tasks:
                         if task.get("id") == task_id:
                             task_found = True
+                            # Log upstream raw progress before conversion
+                            raw_progress = task.get("progress_pct")
+                            debug_logger.log_info(
+                                f"[poll_task_result] task_id={task_id} upstream progress_pct={raw_progress}, status={task.get('status')}"
+                            )
                             # Update progress
-                            progress_pct = task.get("progress_pct")
+                            progress_pct = raw_progress
                             # Handle null progress at the beginning
                             if progress_pct is None:
                                 progress_pct = 0
                             else:
                                 progress_pct = int(progress_pct * 100)
 
-                            # Update last_progress for tracking
-                            last_progress = progress_pct
+                            # 标记：仅在拿到非空官方 progress_pct 时，才认为有“真实进度”
+                            if raw_progress is not None:
+                                has_real_progress = True
+
+                            # Update last_progress for tracking & persist to DB for video tasks
+                            # 这样 /v1/video/tasks/{id} 查询时可以看到更细粒度的进度（而不是一直 0 到 100）。
+                            if progress_pct > last_progress:
+                                last_progress = progress_pct
+                                try:
+                                    await self.db.update_task(
+                                        task_id,
+                                        "processing",
+                                        float(progress_pct),
+                                    )
+                                except Exception as db_error:
+                                    debug_logger.log_error(
+                                        error_message=f"Failed to update video task progress in DB: {str(db_error)}",
+                                        status_code=500,
+                                        response_text=str(db_error),
+                                    )
+                            else:
+                                last_progress = progress_pct
                             status = task.get("status", "processing")
 
                             # Output status every 30 seconds (not just when progress changes)
@@ -539,7 +673,7 @@ class GenerationHandler:
                                 watermark_free_enabled = watermark_free_config.watermark_free_enabled
 
                                 if watermark_free_enabled:
-                                    # Watermark-free mode: post video and get watermark-free URL
+                                    # Watermark-free mode: post video and use parser to get watermark-free URL
                                     debug_logger.log_info(f"Entering watermark-free mode for task {task_id}")
                                     generation_id = item.get("id")
                                     debug_logger.log_info(f"Generation ID: {generation_id}")
@@ -551,13 +685,14 @@ class GenerationHandler:
                                             reasoning_content="**Video Generation Completed**\n\nWatermark-free mode enabled. Publishing video to get watermark-free version...\n"
                                         )
 
-                                    # Get watermark-free config to determine parse method
+                                    # Load watermark-free config (parse method & custom server)
                                     watermark_config = await self.db.get_watermark_free_config()
-                                    parse_method = watermark_config.parse_method or "third_party"
 
                                     # Post video to get watermark-free version
                                     try:
-                                        debug_logger.log_info(f"Calling post_video_for_watermark_free with generation_id={generation_id}, prompt={prompt[:50]}...")
+                                        debug_logger.log_info(
+                                            f"Calling post_video_for_watermark_free with generation_id={generation_id}, prompt={prompt[:50]}..."
+                                        )
                                         post_id = await self.sora_client.post_video_for_watermark_free(
                                             generation_id=generation_id,
                                             prompt=prompt,
@@ -568,27 +703,50 @@ class GenerationHandler:
                                         if not post_id:
                                             raise Exception("Failed to get post ID from publish API")
 
-                                        # Get watermark-free video URL based on parse method
-                                        if parse_method == "custom":
-                                            # Use custom parse server
-                                            if not watermark_config.custom_parse_url or not watermark_config.custom_parse_token:
-                                                raise Exception("Custom parse server URL or token not configured")
+                                        # Decide which parse server to use based on config:
+                                        # - third_party: 默认使用 sorai.me/get-sora-link，或使用自定义 URL
+                                        # - custom: 使用自定义解析服务
+                                        # - 其他/默认: 使用当前 sora2api 实例的内部 /get-sora-link
+                                        parse_method = getattr(watermark_config, "parse_method", "third_party") or "third_party"
 
-                                            if stream:
-                                                yield self._format_stream_chunk(
-                                                    reasoning_content=f"Video published successfully. Post ID: {post_id}\nUsing custom parse server to get watermark-free URL...\n"
-                                                )
-
-                                            debug_logger.log_info(f"Using custom parse server: {watermark_config.custom_parse_url}")
-                                            watermark_free_url = await self.sora_client.get_watermark_free_url_custom(
-                                                parse_url=watermark_config.custom_parse_url,
-                                                parse_token=watermark_config.custom_parse_token,
-                                                post_id=post_id
-                                            )
+                                        if parse_method == "third_party":
+                                            base_url = (
+                                                getattr(watermark_config, "custom_parse_url", None)
+                                                or "https://sorai.me"
+                                            ).rstrip("/")
+                                            parse_token = getattr(watermark_config, "custom_parse_token", None) or ""
+                                        elif parse_method == "custom":
+                                            custom_url = (getattr(watermark_config, "custom_parse_url", None) or "").strip()
+                                            if not custom_url:
+                                                raise Exception("Custom watermark-free parse URL is not configured")
+                                            base_url = custom_url.rstrip("/")
+                                            parse_token = getattr(watermark_config, "custom_parse_token", None) or ""
                                         else:
-                                            # Use third-party parse (default)
-                                            watermark_free_url = f"https://oscdn2.dyysy.com/MP4/{post_id}.mp4"
-                                            debug_logger.log_info(f"Using third-party parse server")
+                                            # Fallback: internal parser (this sora2api instance)
+                                            if config.cache_base_url:
+                                                base_url = config.cache_base_url.rstrip('/')
+                                            else:
+                                                base_url = f"http://127.0.0.1:{config.server_port}"
+                                            parse_token = (
+                                                getattr(watermark_config, "custom_parse_token", None)
+                                                or os.getenv("APP_ACCESS_TOKEN")
+                                                or ""
+                                            )
+
+                                        if stream:
+                                            yield self._format_stream_chunk(
+                                                reasoning_content=(
+                                                    f"Video published successfully. Post ID: {post_id}\n"
+                                                    f"Using internal parser at {base_url} to get watermark-free URL...\n"
+                                                )
+                                            )
+
+                                        debug_logger.log_info(f"Using watermark-free parse server: {base_url}")
+                                        watermark_free_url = await self.sora_client.get_watermark_free_url_custom(
+                                            parse_url=base_url,
+                                            parse_token=parse_token,
+                                            post_id=post_id
+                                        )
 
                                         debug_logger.log_info(f"Watermark-free URL: {watermark_free_url}")
 
@@ -820,14 +978,37 @@ class GenerationHandler:
                                 reasoning_content=f"Image generation in progress... ({elapsed}s elapsed)\n"
                             )
 
-                # Progress update for stream mode (fallback if no status from API)
-                if stream and attempt % 10 == 0:  # Update every 10 attempts (roughly 20% intervals)
+                # Progress update fallback when official API does not report progress:
+                # - 对于视频任务且没有拿到过真实 progress_pct，用时间比例估算进度并写入 DB
+                # - 对于流式任务，仍然保留原有的 SSE 提示
+                if attempt % 10 == 0:  # roughly 20% intervals
                     estimated_progress = min(90, (attempt / max_attempts) * 100)
-                    if estimated_progress > last_progress + 20:  # Update every 20%
+                    if estimated_progress > last_progress + 20:  # 更新粒度约 20%
                         last_progress = estimated_progress
-                        yield self._format_stream_chunk(
-                            reasoning_content=f"**Processing**\n\nGeneration in progress: {estimated_progress:.0f}% completed (estimated)...\n"
-                        )
+
+                        # 仅对视频任务写入 DB 供 /v1/video/tasks/{id} 查询使用，
+                        # 且只在没有拿到过官方 progress_pct 的情况下启用估算，避免覆盖真实进度。
+                        if is_video and not has_real_progress:
+                            try:
+                                await self.db.update_task(
+                                    task_id,
+                                    "processing",
+                                    float(estimated_progress),
+                                )
+                                debug_logger.log_info(
+                                    f"[poll_task_result] task_id={task_id} use estimated_progress={estimated_progress:.0f}% (no real progress_pct from upstream)"
+                                )
+                            except Exception as db_error:
+                                debug_logger.log_error(
+                                    error_message=f"Failed to update estimated video task progress in DB: {str(db_error)}",
+                                    status_code=500,
+                                    response_text=str(db_error),
+                                )
+
+                        if stream:
+                            yield self._format_stream_chunk(
+                                reasoning_content=f"**Processing**\n\nGeneration in progress: {estimated_progress:.0f}% completed (estimated)...\n"
+                            )
             
             except Exception as e:
                 if attempt >= max_attempts - 1:
@@ -850,6 +1031,107 @@ class GenerationHandler:
 
         await self.db.update_task(task_id, "failed", 0, error_message=f"Generation timeout after {timeout} seconds")
         raise Exception(f"Upstream API timeout: Generation exceeded {timeout} seconds limit")
+    
+    async def refresh_video_task_progress(self, task: Task):
+        """Refresh video task progress from upstream once and sync to DB.
+
+        仅用于 /v1/video/tasks/{id} 轮询接口：
+        - 优先使用 DB 中的状态（完成/失败则直接返回）
+        - 若仍在进行中，则调用 Sora 的 pending 接口获取最新 progress_pct
+        - 若拿到进度，则写回 DB 并返回更新后的 Task
+        - 不负责判定“是否已完成”，完成逻辑依旧由后台轮询 _poll_task_result 负责
+        """
+        debug_logger.log_info(
+            f"[refresh_video_task_progress] start task_id={task.task_id}, status={task.status}, local_progress={task.progress}"
+        )
+
+        raw_status = (task.status or "").lower()
+        if raw_status in ["completed", "succeeded", "failed", "error"]:
+            return task, None
+
+        # 获取对应的上游 token
+        try:
+            token_obj = await self.db.get_token(task.token_id)
+        except Exception as e:
+            debug_logger.log_error(
+                error_message=f"Failed to load token for task {task.task_id}: {str(e)}",
+                status_code=500,
+                response_text=str(e),
+            )
+            return task, None
+
+        if not token_obj or not token_obj.token:
+            debug_logger.log_error(
+                error_message=f"No valid token found for task {task.task_id} (token_id={task.token_id})",
+                status_code=500,
+                response_text="token_not_found",
+            )
+            return task, None
+
+        try:
+            pending_tasks = await self.sora_client.get_pending_tasks(token_obj.token)
+        except Exception as e:
+            # 拉取远程进度失败时，不中断接口，仅记录日志并退回到本地 DB 状态
+            debug_logger.log_error(
+                error_message=f"Failed to fetch pending tasks for task {task.task_id}: {str(e)}",
+                status_code=500,
+                response_text=str(e),
+            )
+            return task, None
+
+        # 查找对应 task 的进度，同时保留上游原始信息，供接口返回给调用方查看
+        new_progress = None
+        matched_pending = None
+        for pending in pending_tasks:
+            if pending.get("id") == task.task_id:
+                # 打印上游原始返回，便于排查 progress 逻辑
+                debug_logger.log_info(
+                    f"[refresh_video_task_progress] matched pending for task_id={task.task_id}: {pending}"
+                )
+
+                raw_progress = pending.get("progress_pct")
+                debug_logger.log_info(
+                    f"[refresh_video_task_progress] task_id={task.task_id} upstream progress_pct={raw_progress}, status={pending.get('status')}"
+                )
+
+                matched_pending = pending
+                progress_pct = raw_progress
+                if progress_pct is None:
+                    progress_pct = 0
+                else:
+                    # 与 _poll_task_result 中保持一致：后端返回 0~1，转换为 0~100
+                    progress_pct = int(progress_pct * 100)
+
+                progress_pct = max(0, min(int(progress_pct), 100))
+                new_progress = progress_pct
+                break
+
+        # 未在 pending 中找到，说明是否完成依旧交由后台轮询判断，这里不修改状态
+        if new_progress is None:
+            return task, matched_pending
+
+        # 仅在进度有变化时写回 DB
+        current_progress = int(task.progress or 0)
+        if new_progress <= current_progress:
+            return task, matched_pending
+
+        try:
+            await self.db.update_task(
+                task.task_id,
+                task.status,
+                float(new_progress),
+                result_urls=task.result_urls,
+                error_message=task.error_message,
+            )
+            task.progress = float(new_progress)
+        except Exception as db_error:
+            debug_logger.log_error(
+                error_message=f"Failed to update video task progress in DB (task_id={task.task_id}): {str(db_error)}",
+                status_code=500,
+                response_text=str(db_error),
+            )
+
+        return task, matched_pending
     
     def _format_stream_chunk(self, content: str = None, reasoning_content: str = None,
                             finish_reason: str = None, is_first: bool = False) -> str:

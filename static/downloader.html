@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sora 视频去水印 · 下载链接提取器</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #f0f2f5; color: #333; }
+        .container { background: white; padding: 2rem 3rem; border-radius: 12px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1); width: 90%; max-width: 600px; text-align: center; }
+        h1 { margin-bottom: 0.5rem; font-size: 2rem; }
+        .subtitle { margin-bottom: 1.5rem; font-size: 0.9rem; color: #666; }
+        .gradient-text {
+            background: linear-gradient(120deg, #ff6b6b, #feca57, #54a0ff, #5f27cd, #ff6b6b);
+            background-size: 300% 300%;
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            animation: gradient-move 4s ease-in-out infinite;
+        }
+        @keyframes gradient-move {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+        input[type="url"], input[type="password"] { width: 100%; padding: 12px; margin-bottom: 1rem; border: 1px solid #ccc; border-radius: 8px; box-sizing: border-box; font-size: 16px; }
+        button { width: 100%; padding: 12px; background-color: #007bff; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; transition: background-color 0.3s; }
+        button:disabled { background-color: #a0cfff; cursor: not-allowed; }
+        button:hover:not(:disabled) { background-color: #0056b3; }
+        #result { margin-top: 1.5rem; word-wrap: break-word; text-align: left; background-color: #e9ecef; padding: 1rem; border-radius: 8px; min-height: 50px; }
+        #result a { color: #0056b3; text-decoration: none; }
+        .error { color: #d93025; font-weight: bold; }
+        .footer-link { margin-top: 2rem; font-size: 14px; }
+        .footer-link a { color: #6c757d; text-decoration: none; transition: color 0.2s; }
+        .footer-link a:hover { color: #343a40; text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1><span class="gradient-text">Sora 视频去水印</span></h1>
+        <div class="subtitle">一键提取 Sora 视频无水印下载链接</div>
+        <form id="soraForm">
+            <input type="url" id="soraUrl" placeholder="粘贴 Sora 链接，例如: https://sora.chatgpt.com/p/..." required>
+            <!-- 访问令牌：如果服务端配置了 APP_ACCESS_TOKEN，则必填 -->
+            <input type="password" id="accessToken" placeholder="如后台设置了访问令牌，请在此输入">
+            <button type="submit" id="submitBtn">获取下载链接</button>
+        </form>
+        <div id="result">
+            <p>在这里显示结果...</p>
+        </div>
+        <div class="footer-link">
+            <a href="https://github.com/tibbar213/sora-downloader" target="_blank" rel="noopener noreferrer">
+                GitHub Repository (sora-downloader)
+            </a>
+        </div>
+    </div>
+
+    <script>
+        const form = document.getElementById('soraForm');
+        const urlInput = document.getElementById('soraUrl');
+        const submitBtn = document.getElementById('submitBtn');
+        const resultDiv = document.getElementById('result');
+        const accessTokenInput = document.getElementById('accessToken');
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const soraUrl = urlInput.value;
+            const token = accessTokenInput ? accessTokenInput.value : null;
+
+            submitBtn.disabled = true;
+            submitBtn.textContent = '正在获取...';
+            resultDiv.innerHTML = '<p>请求中，请稍候...</p>';
+
+            try {
+                const response = await fetch('/get-sora-link', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: soraUrl, token: token })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    resultDiv.innerHTML = `
+                        <p><strong>获取成功!</strong></p>
+                        <p>
+                            <a href="${data.download_link}" target="_blank" rel="noopener noreferrer">点击这里下载视频或在新标签页打开</a>
+                        </p>
+                        <p><strong>链接地址:</strong> ${data.download_link}</p>
+                    `;
+                } else {
+                    if (response.status === 401) {
+                        throw new Error('访问令牌错误或无效。');
+                    }
+                    throw new Error(data.error || '发生未知错误');
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `<p class="error">错误: ${error.message}</p>`;
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = '获取下载链接';
+            }
+        });
+    </script>
+</body>
+</html>
