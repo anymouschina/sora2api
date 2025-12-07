@@ -1,5 +1,5 @@
 """API routes - OpenAI compatible endpoints"""
-from fastapi import APIRouter, Depends, HTTPException, Path
+from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile, File, Form, Header
 from fastapi.responses import StreamingResponse, JSONResponse
 from datetime import datetime
 from typing import List, Optional
@@ -66,6 +66,43 @@ async def list_models(api_key: str = Depends(verify_api_key_header)):
         "object": "list",
         "data": models
     }
+
+@router.post("/backend/project_y/file/upload")
+async def upload_file_passthrough(
+    file: UploadFile = File(...),
+    use_case: str = Form("profile"),
+    authorization: str = Header(None),
+):
+    """
+    Passthrough for Sora-style file upload.
+
+    - Path/fields mirror upstream: multipart form with `file` and `use_case`.
+    - Auth: expects `Authorization: Bearer <sora_access_token>`.
+    - Returns upstream JSON and status code (typically includes `file_id`, optional `asset_pointer`/`url`).
+    """
+    if generation_handler is None:
+        raise HTTPException(status_code=500, detail="Generation handler not initialized")
+
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token in Authorization header")
+
+    try:
+        file_bytes = await file.read()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Failed to read uploaded file")
+
+    status_code, resp = await generation_handler.upload_file_passthrough(
+        token=token,
+        file_bytes=file_bytes,
+        filename=file.filename or "image.png",
+        use_case=use_case or "profile",
+    )
+
+    return JSONResponse(status_code=status_code, content=resp)
 
 @router.post("/v1/video/tasks")
 async def create_video_task(

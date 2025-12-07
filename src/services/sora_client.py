@@ -212,6 +212,83 @@ class SoraClient:
 
         result = await self._make_request("POST", "/uploads", token, multipart=mp)
         return result["id"]
+
+    async def upload_file_passthrough(
+        self,
+        token: str,
+        file_data: bytes,
+        filename: str = "image.png",
+        use_case: str = "profile",
+        base_url_override: Optional[str] = None,
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Upload raw file to Sora and return (status_code, response_json).
+
+        This is a lightweight passthrough for /backend/project_y/file/upload so we
+        can proxy uploads without enforcing local API-key auth.
+        """
+        mime_type = "application/octet-stream"
+        if filename.lower().endswith((".png",)):
+            mime_type = "image/png"
+        elif filename.lower().endswith((".jpg", ".jpeg")):
+            mime_type = "image/jpeg"
+        elif filename.lower().endswith(".webp"):
+            mime_type = "image/webp"
+
+        mp = CurlMime()
+        mp.addpart(
+            name="file",
+            content_type=mime_type,
+            filename=filename,
+            data=file_data,
+        )
+        mp.addpart(name="use_case", data=use_case.encode("utf-8"))
+
+        proxy_url = await self.proxy_manager.get_proxy_url()
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+
+        async with AsyncSession() as session:
+            # Allow overriding base URL for fallback
+            base_url = base_url_override or self.base_url
+            url = f"{base_url}/backend/project_y/file/upload"
+
+            kwargs = {
+                "headers": headers,
+                "timeout": self.timeout,
+                "impersonate": "chrome",
+                "multipart": mp,
+            }
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+
+            debug_logger.log_request(
+                method="POST",
+                url=url,
+                headers=headers,
+                files="(binary)",
+                proxy=proxy_url,
+            )
+
+            start_time = time.time()
+            response = await session.post(url, **kwargs)
+            duration_ms = (time.time() - start_time) * 1000
+
+            try:
+                response_json = response.json()
+            except Exception:
+                response_json = {"message": response.text}
+
+            debug_logger.log_response(
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                body=response_json,
+                duration_ms=duration_ms,
+            )
+
+            return response.status_code, response_json
     
     async def generate_image(self, prompt: str, token: str, width: int = 360,
                             height: int = 360, media_id: Optional[str] = None) -> str:

@@ -297,6 +297,45 @@ class GenerationHandler:
             if response.status_code != 200:
                 raise Exception(f"Failed to download file: {response.status_code}")
             return response.content
+
+    async def upload_file_passthrough(
+        self,
+        token: str,
+        file_bytes: bytes,
+        filename: str,
+        use_case: str = "profile"
+    ) -> tuple[int, Dict[str, Any]]:
+        """Upload file to upstream Sora and return (status_code, response_json).
+
+        Tries configured base_url first; if it fails and is not the official domain,
+        falls back once to https://sora.chatgpt.com to mimic TapCanvas behavior.
+        """
+        primary_base = self.sora_client.base_url.rstrip("/")
+        status, resp = await self.sora_client.upload_file_passthrough(
+            token=token,
+            file_data=file_bytes,
+            filename=filename,
+            use_case=use_case,
+        )
+
+        # Fallback to official base if primary is custom and failed
+        official_base = "https://sora.chatgpt.com"
+        if status not in (200, 201) and primary_base != official_base:
+            try:
+                status, resp = await self.sora_client.upload_file_passthrough(
+                    token=token,
+                    file_data=file_bytes,
+                    filename=filename,
+                    use_case=use_case,
+                    base_url_override=official_base,
+                )
+            except Exception as e:
+                debug_logger.log_error(
+                    error_message=f"Upload fallback failed: {str(e)}",
+                    status_code=500,
+                    response_text=str(e),
+                )
+        return status, resp
     
     async def check_token_availability(self, is_image: bool, is_video: bool) -> bool:
         """Check if tokens are available for the given model type
