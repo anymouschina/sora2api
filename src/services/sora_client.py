@@ -6,6 +6,7 @@ import random
 import string
 import re
 from typing import Optional, Dict, Any, Tuple
+from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 from curl_cffi import CurlMime
 from .proxy_manager import ProxyManager
@@ -392,8 +393,21 @@ class SoraClient:
         """
         proxy_url = await self.proxy_manager.get_proxy_url()
 
-        # Construct the share URL
-        share_url = f"https://sora.chatgpt.com/p/{post_id}"
+        # 构造分享链接：
+        # - 对于 sorai.me 等第三方解析服务，要求使用官方域名 sora.chatgpt.com
+        # - 对于自定义/内部解析服务，则使用配置的 front_base_url，方便自建前端域名
+        try:
+            parsed = urlparse(parse_url)
+            host = (parsed.netloc or "").lower()
+        except Exception:
+            host = ""
+
+        if "sorai.me" in host:
+            share_base = "https://sora.chatgpt.com"
+        else:
+            share_base = config.sora_front_base_url.rstrip("/")
+
+        share_url = f"{share_base}/p/{post_id}"
 
         # Prepare request
         json_data = {"url": share_url}

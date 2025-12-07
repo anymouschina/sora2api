@@ -46,6 +46,28 @@ class Config:
         return self._config["sora"]["base_url"]
     
     @property
+    def sora_front_base_url(self) -> str:
+        """
+        Base URL for Sora web frontend (used for Origin/Referer and share URLs).
+        Defaults to the official Sora domain if not configured.
+        """
+        return self._config.get("sora", {}).get(
+            "front_base_url",
+            "https://sora.chatgpt.com"
+        )
+
+    @property
+    def sora_auth_base_url(self) -> str:
+        """
+        Base URL for OpenAI auth endpoints (RT->AT).
+        Defaults to the official auth.openai.com if not configured.
+        """
+        return self._config.get("sora", {}).get(
+            "auth_base_url",
+            "https://auth.openai.com"
+        )
+    
+    @property
     def sora_timeout(self) -> int:
         return self._config["sora"]["timeout"]
     

@@ -67,8 +67,10 @@ class TokenManager:
             headers = {
                 "Authorization": f"Bearer {access_token}",
                 "Accept": "application/json",
-                "Origin": "https://sora.chatgpt.com",
-                "Referer": "https://sora.chatgpt.com/"
+                # Use configurable frontend URL for Origin/Referer so that
+                # calls can be routed via a reverse proxy (e.g. Cloudflare Worker)
+                "Origin": config.sora_front_base_url,
+                "Referer": f"{config.sora_front_base_url}/"
             }
 
             kwargs = {
@@ -108,7 +110,8 @@ class TokenManager:
         }
 
         async with AsyncSession() as session:
-            url = "https://sora.chatgpt.com/backend/billing/subscriptions"
+            # Use configurable Sora backend base URL
+            url = f"{config.sora_base_url}/billing/subscriptions"
             print(f"📡 请求 URL: {url}")
             print(f"🔑 使用 Token: {token[:30]}...")
 
@@ -185,10 +188,7 @@ class TokenManager:
                 kwargs["proxy"] = proxy_url
                 print(f"🌐 使用代理: {proxy_url}")
 
-            response = await session.get(
-                "https://sora.chatgpt.com/backend/project_y/invite/mine",
-                **kwargs
-            )
+            response = await session.get(f"{config.sora_base_url}/project_y/invite/mine", **kwargs)
 
             print(f"📥 响应状态码: {response.status_code}")
 
@@ -260,10 +260,7 @@ class TokenManager:
                 kwargs["proxy"] = proxy_url
                 print(f"🌐 使用代理: {proxy_url}")
 
-            response = await session.get(
-                "https://sora.chatgpt.com/backend/nf/check",
-                **kwargs
-            )
+            response = await session.get(f"{config.sora_base_url}/nf/check", **kwargs)
 
             print(f"📥 响应状态码: {response.status_code}")
 
@@ -319,7 +316,7 @@ class TokenManager:
                 print(f"🌐 使用代理: {proxy_url}")
 
             response = await session.post(
-                "https://sora.chatgpt.com/backend/project_y/profile/username/check",
+                f"{config.sora_base_url}/project_y/profile/username/check",
                 **kwargs
             )
 
@@ -367,7 +364,7 @@ class TokenManager:
                 print(f"🌐 使用代理: {proxy_url}")
 
             response = await session.post(
-                "https://sora.chatgpt.com/backend/project_y/profile/username/set",
+                f"{config.sora_base_url}/project_y/profile/username/set",
                 **kwargs
             )
 
@@ -415,7 +412,7 @@ class TokenManager:
                 print(f"🌐 使用代理: {proxy_url}")
 
             response = await session.post(
-                "https://sora.chatgpt.com/backend/project_y/invite/accept",
+                f"{config.sora_base_url}/project_y/invite/accept",
                 **kwargs
             )
 
@@ -442,8 +439,9 @@ class TokenManager:
             headers = {
                 "Cookie": f"__Secure-next-auth.session-token={session_token}",
                 "Accept": "application/json",
-                "Origin": "https://sora.chatgpt.com",
-                "Referer": "https://sora.chatgpt.com/"
+                # Use configurable frontend URL for Origin/Referer
+                "Origin": config.sora_front_base_url,
+                "Referer": f"{config.sora_front_base_url}/",
             }
 
             kwargs = {
@@ -456,7 +454,8 @@ class TokenManager:
                 kwargs["proxy"] = proxy_url
                 debug_logger.log_info(f"[ST_TO_AT] 使用代理: {proxy_url}")
 
-            url = "https://sora.chatgpt.com/api/auth/session"
+            # Auth session endpoint lives on the Sora frontend host
+            url = f"{config.sora_front_base_url}/api/auth/session"
             debug_logger.log_info(f"[ST_TO_AT] 📡 请求 URL: {url}")
 
             try:
@@ -540,7 +539,8 @@ class TokenManager:
                 kwargs["proxy"] = proxy_url
                 debug_logger.log_info(f"[RT_TO_AT] 使用代理: {proxy_url}")
 
-            url = "https://auth.openai.com/oauth/token"
+            # Use configurable auth base URL so it can be routed via a proxy if needed
+            url = f"{config.sora_auth_base_url}/oauth/token"
             debug_logger.log_info(f"[RT_TO_AT] 📡 请求 URL: {url}")
 
             try:

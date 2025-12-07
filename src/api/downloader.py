@@ -10,6 +10,7 @@ import re
 import asyncio
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter
 from fastapi.responses import FileResponse, JSONResponse
@@ -19,6 +20,7 @@ from curl_cffi.requests import AsyncSession, errors
 from ..services.sora_downloader import auth_manager
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
+from ..core.config import config
 
 
 router = APIRouter()
@@ -70,7 +72,13 @@ async def get_sora_link(request: GetSoraLinkRequest):
     if not sora_url:
         return JSONResponse({"error": "未提供 URL"}, status_code=400)
 
-    match = re.search(r"sora\.chatgpt\.com/p/([a-zA-Z0-9_]+)", sora_url)
+    # 只校验路径格式，允许不同的前端域名（官方 sora.chatgpt.com 或自建 front_base_url）
+    try:
+        parsed = urlparse(sora_url)
+        match = re.search(r"/p/([a-zA-Z0-9_]+)", parsed.path or "")
+    except Exception:
+        match = None
+
     if not match:
         return JSONResponse(
             {"error": "无效的 Sora 链接格式。请发布后复制分享链接"},
@@ -97,8 +105,8 @@ async def get_sora_link(request: GetSoraLinkRequest):
 
         token_obj = tokens[0]
 
-        # Build request
-        api_url = f"https://sora.chatgpt.com/backend/project_y/post/{video_id}"
+        # Build request using configurable Sora backend base URL
+        api_url = f"{config.sora_base_url}/project_y/post/{video_id}"
         headers = {
             "User-Agent": "Sora/1.2025.308",
             "Accept": "application/json",

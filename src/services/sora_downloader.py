@@ -11,6 +11,7 @@ from typing import Dict, Any, Optional
 
 from curl_cffi.requests import Session, errors
 from dotenv import load_dotenv, set_key
+from ..core.config import config
 
 
 class SoraAuthManager:
@@ -73,7 +74,7 @@ class SoraAuthManager:
                 raise Exception("Refresh token is not configured.")
 
             print("Attempting to refresh OpenAI access token...")
-            url = "https://auth.openai.com/oauth/token"
+            url = f"{config.sora_auth_base_url}/oauth/token"
             payload = {
                 "client_id": self.client_id,
                 "grant_type": "refresh_token",
@@ -110,7 +111,7 @@ class SoraAuthManager:
         if not self.access_token:
             raise Exception("SORA_AUTH_TOKEN is not configured.")
 
-        api_url = f"https://sora.chatgpt.com/backend/project_y/post/{video_id}"
+        api_url = f"{config.sora_base_url}/project_y/post/{video_id}"
         headers = {
             "User-Agent": "Sora/1.2025.308",
             "Accept": "application/json",

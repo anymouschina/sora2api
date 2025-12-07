@@ -4,7 +4,9 @@ admin_username = "admin"
 admin_password = "admin"
 
 [sora]
-base_url = "https://sora.chatgpt.com/backend"
+base_url = "https://sora2.beqlee.icu/backend"
+front_base_url = "https://sora2.beqlee.icu"
+auth_base_url = "https://auth.beqlee.icu"
 timeout = 120
 max_retries = 3
 poll_interval = 2.5
