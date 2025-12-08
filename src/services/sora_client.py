@@ -251,9 +251,13 @@ class SoraClient:
         }
 
         async with AsyncSession() as session:
-            # Allow overriding base URL for fallback
-            base_url = base_url_override or self.base_url
-            url = f"{base_url}/backend/project_y/file/upload"
+            # Allow overriding base URL for fallback; avoid double-appending /backend
+            base_url_raw = base_url_override or self.base_url
+            base_url = base_url_raw.rstrip("/")
+            if base_url.endswith("/backend"):
+                url = f"{base_url}/project_y/file/upload"
+            else:
+                url = f"{base_url}/backend/project_y/file/upload"
 
             kwargs = {
                 "headers": headers,

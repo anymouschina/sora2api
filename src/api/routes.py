@@ -6,6 +6,7 @@ from typing import List, Optional
 import json
 import re
 from ..core.auth import verify_api_key_header
+from ..core.config import config
 from ..core.models import ChatCompletionRequest, Task as DbTask
 from ..core.database import Database
 from ..services.generation_handler import GenerationHandler, MODEL_CONFIG
@@ -71,24 +72,51 @@ async def list_models(api_key: str = Depends(verify_api_key_header)):
 async def upload_file_passthrough(
     file: UploadFile = File(...),
     use_case: str = Form("profile"),
-    authorization: str = Header(None),
+    token_id: Optional[int] = Form(None),
+    authorization: Optional[str] = Header(None),
 ):
     """
     Passthrough for Sora-style file upload.
 
-    - Path/fields mirror upstream: multipart form with `file` and `use_case`.
-    - Auth: expects `Authorization: Bearer <sora_access_token>`.
-    - Returns upstream JSON and status code (typically includes `file_id`, optional `asset_pointer`/`url`).
+    Token selection priority:
+    1) token_id form field (must be active)
+    2) Authorization: Bearer <token> header (kept for compatibility)
+    3) Auto-pick from token pool (image-enabled)
+
+    Returns upstream JSON and status code (typically includes `file_id`, optional `asset_pointer`/`url`).
     """
     if generation_handler is None:
         raise HTTPException(status_code=500, detail="Generation handler not initialized")
 
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    # Pick token
+    token_str: Optional[str] = None
+    token_obj = None
 
-    token = authorization.split(" ", 1)[1].strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing token in Authorization header")
+    if token_id is not None:
+        token_obj = await generation_handler.token_manager.db.get_token(token_id)
+        if not token_obj or not token_obj.is_active:
+            raise HTTPException(status_code=400, detail="Invalid or inactive token_id")
+        token_str = token_obj.token
+    else:
+        # Strip Bearer prefix if present
+        header_token = None
+        if authorization:
+            header_token = authorization
+            if authorization.lower().startswith("bearer "):
+                header_token = authorization.split(" ", 1)[1].strip()
+            header_token = header_token or None
+
+        # If header token equals our API key, treat it as client auth, not upstream token
+        if header_token and header_token == config.api_key:
+            header_token = None
+
+        if header_token:
+            token_str = header_token
+        else:
+            token_obj = await generation_handler.load_balancer.select_token(for_image_generation=True)
+            if not token_obj:
+                raise HTTPException(status_code=503, detail="No available tokens for upload")
+            token_str = token_obj.token
 
     try:
         file_bytes = await file.read()
@@ -96,11 +124,18 @@ async def upload_file_passthrough(
         raise HTTPException(status_code=400, detail="Failed to read uploaded file")
 
     status_code, resp = await generation_handler.upload_file_passthrough(
-        token=token,
+        token=token_str,
         file_bytes=file_bytes,
         filename=file.filename or "image.png",
         use_case=use_case or "profile",
     )
+
+    # Lightweight accounting if we used a pooled token
+    if token_obj:
+        try:
+            await generation_handler.token_manager.record_usage(token_obj.id, is_video=False)
+        except Exception:
+            pass
 
     return JSONResponse(status_code=status_code, content=resp)
 
