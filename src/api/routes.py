@@ -44,6 +44,183 @@ def _extract_remix_id(text: str) -> str:
 
     return ""
 
+def _normalize_orientation(body: dict) -> str:
+    """Infer video orientation from explicit field or aspect ratio."""
+    orientation_raw = str(body.get("orientation") or "").lower()
+    aspect_ratio_raw = str(body.get("aspectRatio") or body.get("aspect_ratio") or "").lower()
+
+    if orientation_raw in ["portrait", "vertical"]:
+        return "portrait"
+    if orientation_raw in ["landscape", "horizontal", "wide", "widescreen"]:
+        return "landscape"
+
+    ratio_value = None
+    if aspect_ratio_raw:
+        ratio_match = re.match(r"(\d+(?:\.\d+)?)[/:](\d+(?:\.\d+)?)", aspect_ratio_raw)
+        if ratio_match:
+            try:
+                width = float(ratio_match.group(1))
+                height = float(ratio_match.group(2))
+                if height > 0:
+                    ratio_value = width / height
+            except Exception:
+                ratio_value = None
+        else:
+            try:
+                ratio_value = float(aspect_ratio_raw)
+            except Exception:
+                ratio_value = None
+
+    if ratio_value is not None:
+        return "portrait" if ratio_value < 1 else "landscape"
+
+    return "landscape"
+
+def _normalize_duration_seconds(body: dict) -> int:
+    """Pick duration bucket (10s/15s) from request body."""
+    duration_raw = body.get("durationSeconds")
+    if duration_raw is None:
+        duration_raw = body.get("duration")
+
+    duration_val: Optional[float] = None
+    if isinstance(duration_raw, (int, float)):
+        duration_val = float(duration_raw)
+    elif isinstance(duration_raw, str) and duration_raw.strip():
+        try:
+            duration_val = float(duration_raw.strip())
+        except ValueError:
+            duration_val = None
+
+    # Only 10s and 15s variants are supported in MODEL_CONFIG
+    if duration_val is not None and duration_val > 10:
+        return 15
+    return 10
+
+def _normalize_video_model_key(model_raw: Optional[str], orientation: str, duration_seconds: int) -> Optional[str]:
+    """Map incoming model name to an internal MODEL_CONFIG key."""
+    duration_bucket = 15 if duration_seconds > 10 else 10
+    if model_raw is None:
+        normalized = ""
+    elif isinstance(model_raw, str):
+        normalized = model_raw.strip()
+    else:
+        normalized = str(model_raw).strip()
+
+    model_key = normalized.lower()
+    if model_key in MODEL_CONFIG:
+        return model_key
+
+    # Handle common aliases
+    alias_orientation = None
+    if model_key in {"sora", "sora-2", "sora2", "sora-video", "sora-video-s"}:
+        alias_orientation = None
+    elif model_key in {"sora-video-portrait", "sora-video-vertical"}:
+        alias_orientation = "portrait"
+    elif model_key == "sora-video-landscape":
+        alias_orientation = "landscape"
+    elif model_key in {"sora-video-10s", "sora-video-15s"}:
+        # Orientation-less variants already exist in MODEL_CONFIG
+        return model_key
+    else:
+        # Try to parse names like sora-video-landscape-10 or sora-video-portrait-15s
+        match = re.match(r"sora-video-(portrait|landscape)-?(\d+)", model_key)
+        if match:
+            parsed_orientation = match.group(1)
+            parsed_duration = int(match.group(2))
+            duration_bucket = 15 if parsed_duration > 10 else 10
+            candidate = f"sora-video-{parsed_orientation}-{duration_bucket}s"
+            if candidate in MODEL_CONFIG:
+                return candidate
+
+    if alias_orientation:
+        orientation = alias_orientation
+
+    candidate = f"sora-video-{orientation}-{duration_bucket}s"
+    if candidate in MODEL_CONFIG:
+        return candidate
+
+    fallback = f"sora-video-{duration_bucket}s"
+    if fallback in MODEL_CONFIG:
+        return fallback
+
+    return None
+
+def _normalize_video_task_request(body: dict) -> tuple[str, str, Optional[str]]:
+    """Normalize incoming video task payload to internal parameters."""
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid request body")
+
+    prompt_raw = body.get("prompt")
+    if isinstance(prompt_raw, str):
+        prompt = prompt_raw.strip()
+    elif prompt_raw is None:
+        prompt = ""
+    else:
+        prompt = str(prompt_raw).strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    # Remix/post id compatibility
+    remix_target_id = None
+    for key in ["remixTargetId", "remix_target_id", "pid", "postId", "post_id"]:
+        candidate = body.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            remix_target_id = _extract_remix_id(candidate) or candidate.strip()
+            break
+    if not remix_target_id:
+        remix_target_id = _extract_remix_id(prompt)
+
+    orientation = _normalize_orientation(body)
+    duration_seconds = _normalize_duration_seconds(body)
+    model = _normalize_video_model_key(body.get("model"), orientation, duration_seconds)
+    if not model:
+        raise HTTPException(status_code=400, detail="Invalid model or unsupported duration/orientation")
+
+    return model, prompt, remix_target_id
+
+def _format_character_task(task: DbTask):
+    """Format character task for polling responses."""
+    raw_status = (task.status or "").lower()
+    if raw_status in ["completed", "succeeded"]:
+        status = "succeeded"
+    elif raw_status in ["failed", "error"]:
+        status = "failed"
+    else:
+        status = "running"
+
+    progress = int(task.progress or 0)
+    progress = max(0, min(progress, 100))
+
+    character_id = None
+    username = None
+    display_name = None
+    if task.result_urls:
+        try:
+            results = json.loads(task.result_urls)
+            if isinstance(results, list) and results:
+                entry = results[0]
+                if isinstance(entry, dict):
+                    character_id = entry.get("character_id")
+                    username = entry.get("username")
+                    display_name = entry.get("display_name")
+        except Exception:
+            pass
+
+    payload = {
+        "id": task.task_id,
+        "status": status,
+        "progress": progress,
+        "results": [],
+        "error": task.error_message,
+    }
+    if character_id:
+        payload["results"] = [{
+            "character_id": character_id,
+            "username": username,
+            "display_name": display_name,
+        }]
+    return payload
+
 @router.get("/v1/models")
 async def list_models(api_key: str = Depends(verify_api_key_header)):
     """List available models"""
@@ -139,7 +316,39 @@ async def upload_file_passthrough(
 
     return JSONResponse(status_code=status_code, content=resp)
 
+async def _create_video_task_common(body: dict):
+    """Shared video-task creation logic (used by multiple compatible routes)."""
+    if generation_handler is None:
+        raise HTTPException(status_code=500, detail="Generation handler not initialized")
+
+    model, prompt, remix_target_id = _normalize_video_task_request(body)
+
+    try:
+        task_id = await generation_handler.create_video_task(
+            model=model,
+            prompt=prompt,
+            remix_target_id=remix_target_id,
+        )
+        response = {
+            "id": task_id,
+            "taskId": task_id,  # grsai-compatible field
+            "status": "running",
+            "progress": 0,
+        }
+        if remix_target_id:
+            response["pid"] = remix_target_id
+            response["remixTargetId"] = remix_target_id
+        return response
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.post("/v1/video/tasks")
+@router.post("/v1/video/sora")
+@router.post("/v1/video/sora-video")
+@router.post("/client/v1/video/sora")
+@router.post("/client/v1/video/sora-video")
+@router.post("/client/video/sora")
+@router.post("/client/video/sora-video")
 async def create_video_task(
     body: dict,
     api_key: str = Depends(verify_api_key_header),
@@ -147,33 +356,68 @@ async def create_video_task(
     """
     Create a video generation task (non-streaming).
 
-    Expected payload:
-    {
-      "model": "sora-video-landscape-10s",
-      "prompt": "...",
-      "durationSeconds": 10,
-      "orientation": "landscape"
-    }
+    This handler is lenient with model/duration/orientation aliases to match
+    different sora2api/grsai client expectations.
     """
+    return await _create_video_task_common(body)
+
+@router.post("/v1/video/sora-upload-character")
+@router.post("/client/v1/video/sora-upload-character")
+@router.post("/client/video/sora-upload-character")
+async def upload_character(
+    body: dict,
+    api_key: str = Depends(verify_api_key_header),
+):
+    """Trigger character creation from a video URL (non-stream)."""
     if generation_handler is None:
         raise HTTPException(status_code=500, detail="Generation handler not initialized")
 
-    model = body.get("model")
-    prompt = body.get("prompt") or ""
-    if not model or not isinstance(model, str):
-        raise HTTPException(status_code=400, detail="model is required")
-    if model not in MODEL_CONFIG:
-        raise HTTPException(status_code=400, detail=f"Invalid model: {model}")
-    if MODEL_CONFIG[model]["type"] != "video":
-        raise HTTPException(status_code=400, detail="Only video models are supported by this endpoint")
-    if not prompt:
-        raise HTTPException(status_code=400, detail="prompt is required")
+    video_url = (body.get("url") or body.get("video") or "").strip()
+    if not video_url:
+        raise HTTPException(status_code=400, detail="url is required")
 
-    # 当前 durationSeconds/orientation 主要由 model 决定；保持参数兼容但暂不细化控制
     try:
-        task_id = await generation_handler.create_video_task(model=model, prompt=prompt)
+        task_id = await generation_handler.create_character_task(video_url, is_pid=False)
         return {
             "id": task_id,
+            "taskId": task_id,
+            "status": "running",
+            "progress": 0,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/v1/video/sora-create-character")
+@router.post("/client/v1/video/sora-create-character")
+@router.post("/client/video/sora-create-character")
+@router.post("/v1/video/characters/create")
+@router.post("/client/v1/video/characters/create")
+@router.post("/client/video/characters/create")
+async def create_character_from_pid(
+    body: dict,
+    api_key: str = Depends(verify_api_key_header),
+):
+    """Create character using a published pid (non-stream)."""
+    if generation_handler is None:
+        raise HTTPException(status_code=500, detail="Generation handler not initialized")
+
+    pid_raw = (
+        body.get("pid")
+        or body.get("postId")
+        or body.get("post_id")
+        or body.get("id")
+        or ""
+    )
+    pid = _extract_remix_id(pid_raw) if isinstance(pid_raw, str) else None
+    if not pid:
+        raise HTTPException(status_code=400, detail="pid is required")
+
+    try:
+        task_id = await generation_handler.create_character_task(pid, is_pid=True)
+        return {
+            "id": task_id,
+            "taskId": task_id,
+            "pid": pid,
             "status": "running",
             "progress": 0,
         }
@@ -252,6 +496,27 @@ async def get_video_task(
         "upstream": upstream,
         "upstream_raw": upstream_raw,
     }
+
+@router.post("/v1/draw/result")
+async def get_draw_result(
+    body: dict,
+    api_key: str = Depends(verify_api_key_header),
+):
+    """
+    grsai-style polling endpoint: accepts {"id": "<task_id>"} and returns the
+    same payload as GET /v1/video/tasks/{id}.
+    """
+    task_id_raw = body.get("id") or body.get("taskId") or body.get("task_id") or ""
+    if not isinstance(task_id_raw, str):
+        task_id_raw = str(task_id_raw)
+    task_id = task_id_raw.strip()
+    if not task_id:
+        raise HTTPException(status_code=400, detail="id is required")
+    db: Database = generation_handler.db  # type: ignore[attr-defined]
+    task: Optional[DbTask] = await db.get_task(task_id)
+    if task and (task.model or "").startswith("sora-character"):
+        return _format_character_task(task)
+    return await get_video_task(task_id=task_id, api_key=api_key)
 
 @router.post("/v1/chat/completions")
 async def create_chat_completion(

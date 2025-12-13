@@ -6,6 +6,7 @@ import time
 import random
 import re
 import os
+from uuid import uuid4
 from typing import Optional, AsyncGenerator, Dict, Any
 from datetime import datetime
 from .sora_client import SoraClient, SoraAPIError
@@ -83,11 +84,77 @@ class GenerationHandler:
         self.load_balancer = load_balancer
         self.db = db
         self.concurrency_manager = concurrency_manager
+        self.proxy_manager = proxy_manager
         self.file_cache = FileCache(
             cache_dir="tmp",
             default_timeout=config.cache_timeout,
             proxy_manager=proxy_manager
         )
+
+    async def _resolve_video_url_from_pid(self, pid: str) -> str:
+        """Resolve downloadable video URL from a Sora share pid using the token pool."""
+        from curl_cffi.requests import AsyncSession
+
+        tokens = await self.token_manager.get_active_tokens()
+        if not tokens:
+            raise Exception("No available tokens to resolve pid")
+
+        token_obj = tokens[0]
+        api_url = f"{config.sora_base_url}/project_y/post/{pid}"
+        headers = {
+            "User-Agent": "Sora/1.2025.308",
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "oai-package-name": "com.openai.sora",
+            "authorization": f"Bearer {token_obj.token}",
+        }
+
+        proxy_url = None
+        if self.proxy_manager:
+            try:
+                proxy_url = await self.proxy_manager.get_proxy_url()
+            except Exception:
+                proxy_url = None
+
+        kwargs = {
+            "headers": headers,
+            "timeout": 20,
+            "impersonate": "chrome110",
+        }
+        if proxy_url:
+            kwargs["proxy"] = proxy_url
+
+        async with AsyncSession() as session:
+            response = await session.get(api_url, **kwargs)
+            if response.status_code != 200:
+                raise Exception(f"Failed to fetch post detail for pid {pid}: {response.status_code}")
+
+            data = response.json()
+
+        def _collect_urls(obj):
+            urls = []
+            if not obj or not isinstance(obj, dict):
+                return urls
+            for key in ["downloadable_url", "url", "video_url", "videoUrl"]:
+                val = obj.get(key)
+                if isinstance(val, str) and val.strip():
+                    urls.append(val.strip())
+            attachments = obj.get("attachments") or obj.get("post_attachments")
+            if isinstance(attachments, list):
+                for att in attachments:
+                    if isinstance(att, dict):
+                        urls.extend(_collect_urls(att))
+            post_obj = obj.get("post")
+            if isinstance(post_obj, dict):
+                urls.extend(_collect_urls(post_obj))
+            return urls
+
+        candidates = _collect_urls(data)
+        for url in candidates:
+            if url.startswith("http"):
+                return url
+
+        raise Exception("No downloadable video URL found for pid")
 
     @staticmethod
     def _extract_sora_error_code(payload: Any) -> Optional[str]:
@@ -132,7 +199,7 @@ class GenerationHandler:
             )
         return False
 
-    async def create_video_task(self, model: str, prompt: str) -> str:
+    async def create_video_task(self, model: str, prompt: str, remix_target_id: Optional[str] = None) -> str:
         """Create a video generation task and poll it in background.
 
         面向 TapCanvas 这类上游：返回 taskId，前端只需轮询本服务的
@@ -152,6 +219,7 @@ class GenerationHandler:
         # Determine number of frames and orientation from model config
         n_frames = model_config.get("n_frames", 300)
         orientation = model_config.get("orientation", "landscape")
+        clean_prompt = self._clean_remix_link_from_prompt(prompt) if remix_target_id else prompt
 
         for _ in range(max_token_attempts):
             token_obj = await self.load_balancer.select_token(for_image_generation=False, for_video_generation=True)
@@ -174,6 +242,15 @@ class GenerationHandler:
             task_id: Optional[str] = None
             try:
                 async def _create_with_token(access_token: str) -> str:
+                    if remix_target_id:
+                        return await self.sora_client.remix_video(
+                            remix_target_id=remix_target_id,
+                            prompt=clean_prompt,
+                            token=access_token,
+                            orientation=orientation,
+                            n_frames=n_frames,
+                        )
+
                     if self.sora_client.is_storyboard_prompt(prompt):
                         formatted_prompt = self.sora_client.format_storyboard_prompt(prompt)
                         debug_logger.log_info(f"[video-task] Storyboard mode. Formatted prompt: {formatted_prompt}")
@@ -225,7 +302,7 @@ class GenerationHandler:
                     task_id=task_id,
                     token_id=token_obj.id,
                     model=model,
-                    prompt=prompt,
+                    prompt=f"remix:{remix_target_id} {clean_prompt}" if remix_target_id else prompt,
                     status="processing",
                     progress=0.0,
                 )
@@ -242,7 +319,7 @@ class GenerationHandler:
                             task_access_token,
                             True,
                             False,  # stream=False → 不写 SSE，只更新任务表
-                            prompt,
+                            clean_prompt if remix_target_id else prompt,
                             token_obj.id,
                         ):
                             # chunks 用于 SSE，这里忽略即可
@@ -282,6 +359,116 @@ class GenerationHandler:
             "No available tokens for video generation. All tokens are either disabled, cooling down, "
             "Sora2 quota exhausted, don't support Sora2, or expired."
         )
+
+    async def create_character_task(self, video_source: str, is_pid: bool = False) -> str:
+        """Create a character task (non-stream), persist to DB and process in background."""
+        if not video_source:
+            raise ValueError("video source is required")
+
+        token_obj = await self.load_balancer.select_token(for_video_generation=True)
+        if not token_obj:
+            raise Exception("No available tokens for character creation")
+
+        # Acquire concurrency slot for video-like operations
+        concurrency_acquired = False
+        if self.concurrency_manager:
+            concurrency_acquired = await self.concurrency_manager.acquire_video(token_obj.id)
+            if not concurrency_acquired:
+                raise Exception(f"Failed to acquire concurrency slot for token {token_obj.id}")
+
+        task_id = f"char_{uuid4().hex}"
+        model_name = "sora-character"
+
+        # Persist task
+        task = Task(
+            task_id=task_id,
+            token_id=token_obj.id,
+            model=model_name,
+            prompt=video_source,
+            status="processing",
+            progress=0.0,
+        )
+        await self.db.create_task(task)
+
+        # Lightweight usage accounting
+        await self.token_manager.record_usage(token_obj.id, is_video=True)
+
+        async def _runner():
+            try:
+                # Resolve video URL if pid provided
+                video_url = video_source
+                if is_pid:
+                    video_url = await self._resolve_video_url_from_pid(video_source)
+
+                await self.db.update_task(task_id, "processing", 5.0)
+
+                # Download video bytes
+                video_bytes = await self._download_file(video_url)
+                await self.db.update_task(task_id, "processing", 20.0)
+
+                # Upload video to get cameo id
+                cameo_id = await self.sora_client.upload_character_video(video_bytes, token_obj.token)
+                await self.db.update_task(task_id, "processing", 35.0)
+
+                # Poll cameo status
+                cameo_status = await self._poll_cameo_status(cameo_id, token_obj.token)
+                username_hint = cameo_status.get("username_hint", "character")
+                display_name = cameo_status.get("display_name_hint", "Character")
+                profile_asset_url = cameo_status.get("profile_asset_url")
+                if not profile_asset_url:
+                    raise Exception("Profile asset URL not found in cameo status")
+
+                username = self._process_character_username(username_hint)
+                await self.db.update_task(task_id, "processing", 50.0)
+
+                # Download avatar and upload
+                avatar_data = await self.sora_client.download_character_image(profile_asset_url)
+                asset_pointer = await self.sora_client.upload_character_image(avatar_data, token_obj.token)
+                await self.db.update_task(task_id, "processing", 65.0)
+
+                # Finalize character
+                instruction_set = cameo_status.get("instruction_set_hint") or cameo_status.get("instruction_set")
+                character_id = await self.sora_client.finalize_character(
+                    cameo_id=cameo_id,
+                    username=username,
+                    display_name=display_name,
+                    profile_asset_pointer=asset_pointer,
+                    instruction_set=instruction_set,
+                    token=token_obj.token
+                )
+                await self.db.update_task(task_id, "processing", 85.0)
+
+                # Set public (best effort)
+                try:
+                    await self.sora_client.set_character_public(cameo_id, token_obj.token)
+                except Exception as e:
+                    debug_logger.log_error(
+                        error_message=f"Failed to set character public: {str(e)}",
+                        status_code=500,
+                        response_text=str(e)
+                    )
+
+                result_payload = json.dumps([{
+                    "character_id": character_id,
+                    "username": username,
+                    "display_name": display_name,
+                }])
+                await self.db.update_task(task_id, "completed", 100.0, result_urls=result_payload)
+                await self.token_manager.record_success(token_obj.id, is_video=True)
+            except Exception as e:
+                await self.db.update_task(task_id, "failed", 100.0, error_message=str(e))
+                await self.token_manager.record_error(token_obj.id)
+                debug_logger.log_error(
+                    error_message=f"[character-task] Failed for task {task_id}: {str(e)}",
+                    status_code=500,
+                    response_text=str(e),
+                )
+            finally:
+                if self.concurrency_manager and concurrency_acquired:
+                    await self.concurrency_manager.release_video(token_obj.id)
+
+        asyncio.create_task(_runner())
+        return task_id
 
     def _get_base_url(self) -> str:
         """Get base URL for cache files"""
@@ -373,23 +560,37 @@ class GenerationHandler:
         Returns:
             File bytes
         """
-        from curl_cffi.requests import AsyncSession
+        from curl_cffi.requests import AsyncSession, errors
 
-        proxy_url = await self.load_balancer.proxy_manager.get_proxy_url()
+        proxy_url = None
+        if self.proxy_manager:
+            try:
+                proxy_url = await self.proxy_manager.get_proxy_url()
+            except Exception:
+                proxy_url = None
 
-        kwargs = {
-            "timeout": 30,
-            "impersonate": "chrome"
-        }
+        timeout_seconds = 120
+        for attempt in range(2):
+            try:
+                kwargs = {
+                    "timeout": timeout_seconds,
+                    "impersonate": "chrome"
+                }
 
-        if proxy_url:
-            kwargs["proxy"] = proxy_url
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
 
-        async with AsyncSession() as session:
-            response = await session.get(url, **kwargs)
-            if response.status_code != 200:
-                raise Exception(f"Failed to download file: {response.status_code}")
-            return response.content
+                async with AsyncSession() as session:
+                    response = await session.get(url, **kwargs)
+                    if response.status_code != 200:
+                        raise Exception(f"Failed to download file: {response.status_code}")
+                    return response.content
+            except errors.RequestsError as e:
+                # Retry once on timeout
+                msg = str(e)
+                if attempt == 0 and "28)" in msg:
+                    continue
+                raise
 
     async def upload_file_passthrough(
         self,
