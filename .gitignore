@@ -43,9 +43,10 @@ data/*.sqlite
 .DS_Store
 Thumbs.db
 
+
 # Logs
 *.log
-
+logs.txt
 # Node
 node_modules/
 npm-debug.log*

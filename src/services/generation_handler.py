@@ -8,13 +8,13 @@ import re
 import os
 from typing import Optional, AsyncGenerator, Dict, Any
 from datetime import datetime
-from .sora_client import SoraClient
+from .sora_client import SoraClient, SoraAPIError
 from .token_manager import TokenManager
 from .load_balancer import LoadBalancer
 from .file_cache import FileCache
 from .concurrency_manager import ConcurrencyManager
 from ..core.database import Database
-from ..core.models import Task, RequestLog
+from ..core.models import Task, RequestLog, Token
 from ..core.config import config
 from ..core.logger import debug_logger
 
@@ -69,6 +69,9 @@ MODEL_CONFIG = {
     }
 }
 
+class TerminalTaskError(Exception):
+    pass
+
 class GenerationHandler:
     """Handle generation requests"""
 
@@ -86,6 +89,49 @@ class GenerationHandler:
             proxy_manager=proxy_manager
         )
 
+    @staticmethod
+    def _extract_sora_error_code(payload: Any) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+        error = payload.get("error")
+        if not error and isinstance(payload.get("detail"), dict):
+            error = payload["detail"].get("error")
+        if not isinstance(error, dict):
+            return None
+        code = error.get("code")
+        return code if isinstance(code, str) else None
+
+    async def _refresh_access_token_now(self, token_obj: Token) -> bool:
+        try:
+            if token_obj.id is None:
+                return False
+
+            db_token = await self.db.get_token(token_obj.id)
+            if not db_token:
+                return False
+
+            if db_token.st:
+                result = await self.token_manager.st_to_at(db_token.st)
+                new_at = result.get("access_token")
+                if new_at:
+                    await self.token_manager.update_token(db_token.id, token=new_at)
+                    return True
+
+            if db_token.rt:
+                result = await self.token_manager.rt_to_at(db_token.rt)
+                new_at = result.get("access_token")
+                new_rt = result.get("refresh_token")
+                if new_at:
+                    await self.token_manager.update_token(db_token.id, token=new_at, rt=new_rt)
+                    return True
+        except Exception as e:
+            debug_logger.log_error(
+                error_message=f"Failed to refresh access token now: {str(e)}",
+                status_code=500,
+                response_text=str(e),
+            )
+        return False
+
     async def create_video_task(self, model: str, prompt: str) -> str:
         """Create a video generation task and poll it in background.
 
@@ -99,96 +145,143 @@ class GenerationHandler:
         if model_config.get("type") != "video":
             raise ValueError("create_video_task only supports video models")
 
-        # Select token for video generation
-        token_obj = await self.load_balancer.select_token(for_image_generation=False, for_video_generation=True)
-        if not token_obj:
-            raise Exception(
-                "No available tokens for video generation. All tokens are either disabled, cooling down, "
-                "Sora2 quota exhausted, don't support Sora2, or expired."
-            )
+        tried_token_ids: set[int] = set()
+        last_error: Optional[Exception] = None
+        max_token_attempts = 5
 
-        # Acquire concurrency slot for video generation
-        if self.concurrency_manager:
-            concurrency_acquired = await self.concurrency_manager.acquire_video(token_obj.id)
-            if not concurrency_acquired:
-                raise Exception(f"Failed to acquire concurrency slot for token {token_obj.id}")
+        # Determine number of frames and orientation from model config
+        n_frames = model_config.get("n_frames", 300)
+        orientation = model_config.get("orientation", "landscape")
 
-        task_id: Optional[str] = None
-        try:
-            # Determine number of frames and orientation from model config
-            n_frames = model_config.get("n_frames", 300)
-            orientation = model_config.get("orientation", "landscape")
+        for _ in range(max_token_attempts):
+            token_obj = await self.load_balancer.select_token(for_image_generation=False, for_video_generation=True)
+            if not token_obj:
+                break
+            if token_obj.id is None:
+                continue
+            if token_obj.id in tried_token_ids:
+                continue
+            tried_token_ids.add(token_obj.id)
 
-            # Storyboard vs normal prompt
-            if self.sora_client.is_storyboard_prompt(prompt):
-                formatted_prompt = self.sora_client.format_storyboard_prompt(prompt)
-                debug_logger.log_info(f"[video-task] Storyboard mode. Formatted prompt: {formatted_prompt}")
-                task_id = await self.sora_client.generate_storyboard(
-                    formatted_prompt,
-                    token_obj.token,
-                    orientation=orientation,
-                    media_id=None,
-                    n_frames=n_frames,
-                )
-            else:
-                task_id = await self.sora_client.generate_video(
-                    prompt,
-                    token_obj.token,
-                    orientation=orientation,
-                    media_id=None,
-                    n_frames=n_frames,
-                )
-
-            if not task_id:
-                raise Exception("Upstream did not return task id")
-
-            # Persist task
-            task = Task(
-                task_id=task_id,
-                token_id=token_obj.id,
-                model=model,
-                prompt=prompt,
-                status="processing",
-                progress=0.0,
-            )
-            await self.db.create_task(task)
-
-            # Record usage
-            await self.token_manager.record_usage(token_obj.id, is_video=True)
-
-            # Launch background poller (no SSE, 仅更新数据库和内部状态)
-            async def _runner():
-                try:
-                    async for _ in self._poll_task_result(
-                        task_id,
-                        token_obj.token,
-                        True,
-                        False,  # stream=False → 不写 SSE，只更新任务表
-                        prompt,
-                        token_obj.id,
-                    ):
-                        # chunks 用于 SSE，这里忽略即可
-                        pass
-                    await self.token_manager.record_success(token_obj.id, is_video=True)
-                except Exception as e:
-                    await self.token_manager.record_error(token_obj.id)
-                    debug_logger.log_error(
-                        error_message=f"[video-task] Background polling failed for task {task_id}: {str(e)}",
-                        status_code=500,
-                        response_text=str(e),
-                    )
-                finally:
-                    if self.concurrency_manager:
-                        await self.concurrency_manager.release_video(token_obj.id)
-
-            asyncio.create_task(_runner())
-
-            return task_id
-        except Exception:
-            # Release concurrency slot if creation itself fails
+            # Acquire concurrency slot for video generation
+            concurrency_acquired = False
             if self.concurrency_manager:
-                await self.concurrency_manager.release_video(token_obj.id)
-            raise
+                concurrency_acquired = await self.concurrency_manager.acquire_video(token_obj.id)
+                if not concurrency_acquired:
+                    last_error = Exception(f"Failed to acquire concurrency slot for token {token_obj.id}")
+                    continue
+
+            task_id: Optional[str] = None
+            try:
+                async def _create_with_token(access_token: str) -> str:
+                    if self.sora_client.is_storyboard_prompt(prompt):
+                        formatted_prompt = self.sora_client.format_storyboard_prompt(prompt)
+                        debug_logger.log_info(f"[video-task] Storyboard mode. Formatted prompt: {formatted_prompt}")
+                        return await self.sora_client.generate_storyboard(
+                            formatted_prompt,
+                            access_token,
+                            orientation=orientation,
+                            media_id=None,
+                            n_frames=n_frames,
+                        )
+                    return await self.sora_client.generate_video(
+                        prompt,
+                        access_token,
+                        orientation=orientation,
+                        media_id=None,
+                        n_frames=n_frames,
+                    )
+
+                task_access_token = token_obj.token
+                try:
+                    task_id = await _create_with_token(task_access_token)
+                except SoraAPIError as e:
+                    last_error = e
+                    code = self._extract_sora_error_code(e.response_json)
+                    if e.status_code == 401 and code in {"token_invalidated", "token_expired"}:
+                        debug_logger.log_info(
+                            f"[video-task] Token {token_obj.id} auth failed ({code}). Trying to refresh and retry..."
+                        )
+                        refreshed = await self._refresh_access_token_now(token_obj)
+                        if refreshed:
+                            refreshed_token = await self.db.get_token(token_obj.id)
+                            if refreshed_token:
+                                task_access_token = refreshed_token.token
+                                task_id = await _create_with_token(task_access_token)
+                            else:
+                                task_id = await _create_with_token(task_access_token)
+                        else:
+                            await self.token_manager.disable_token(token_obj.id)
+                            await self.token_manager.record_error(token_obj.id)
+                            continue
+                    else:
+                        raise
+
+                if not task_id:
+                    raise Exception("Upstream did not return task id")
+
+                # Persist task
+                task = Task(
+                    task_id=task_id,
+                    token_id=token_obj.id,
+                    model=model,
+                    prompt=prompt,
+                    status="processing",
+                    progress=0.0,
+                )
+                await self.db.create_task(task)
+
+                # Record usage
+                await self.token_manager.record_usage(token_obj.id, is_video=True)
+
+                # Launch background poller (no SSE, 仅更新数据库和内部状态)
+                async def _runner():
+                    try:
+                        async for _ in self._poll_task_result(
+                            task_id,
+                            task_access_token,
+                            True,
+                            False,  # stream=False → 不写 SSE，只更新任务表
+                            prompt,
+                            token_obj.id,
+                        ):
+                            # chunks 用于 SSE，这里忽略即可
+                            pass
+                        await self.token_manager.record_success(token_obj.id, is_video=True)
+                    except Exception as e:
+                        await self.token_manager.record_error(token_obj.id)
+                        debug_logger.log_error(
+                            error_message=f"[video-task] Background polling failed for task {task_id}: {str(e)}",
+                            status_code=500,
+                            response_text=str(e),
+                        )
+                    finally:
+                        if self.concurrency_manager:
+                            await self.concurrency_manager.release_video(token_obj.id)
+
+                asyncio.create_task(_runner())
+                return task_id
+            except SoraAPIError as e:
+                last_error = e
+                code = self._extract_sora_error_code(e.response_json)
+                if e.status_code == 401 and code in {"token_invalidated", "token_expired"}:
+                    # Refresh失败或刷新后仍失败：禁用该 token 并尝试下一个
+                    await self.token_manager.disable_token(token_obj.id)
+                    await self.token_manager.record_error(token_obj.id)
+                    continue
+                raise
+            finally:
+                # Release concurrency slot if creation itself fails for this token
+                if task_id is None and self.concurrency_manager and concurrency_acquired:
+                    await self.concurrency_manager.release_video(token_obj.id)
+
+        if last_error:
+            raise last_error
+
+        raise Exception(
+            "No available tokens for video generation. All tokens are either disabled, cooling down, "
+            "Sora2 quota exhausted, don't support Sora2, or expired."
+        )
 
     def _get_base_url(self) -> str:
         """Get base URL for cache files"""
@@ -707,6 +800,39 @@ class GenerationHandler:
                         # Find matching task in drafts
                         for item in items:
                             if item.get("task_id") == task_id:
+                                draft_kind = (item.get("kind") or "").strip().lower()
+                                if draft_kind and draft_kind != "sora_draft":
+                                    if draft_kind == "sora_content_violation":
+                                        reason = (
+                                            item.get("markdown_reason_str")
+                                            or item.get("reason_str")
+                                            or item.get("reason")
+                                            or "Content violates upstream guardrails"
+                                        )
+                                        error_message = f"Content blocked: {reason}"
+                                    elif draft_kind == "sora_error":
+                                        reason = item.get("error_reason") or "processing_error"
+                                        error_message = f"Upstream error: {reason}"
+                                    else:
+                                        reason = (
+                                            item.get("reason_str")
+                                            or item.get("error_reason")
+                                            or item.get("reason")
+                                            or ""
+                                        )
+                                        error_message = (
+                                            f"Upstream returned {draft_kind}"
+                                            + (f": {reason}" if reason else "")
+                                        )
+
+                                    await self.db.update_task(
+                                        task_id,
+                                        "failed",
+                                        100.0,
+                                        error_message=error_message,
+                                    )
+                                    raise TerminalTaskError(error_message)
+
                                 # Check if watermark-free mode is enabled
                                 watermark_free_config = await self.db.get_watermark_free_config()
                                 watermark_free_enabled = watermark_free_config.watermark_free_enabled
@@ -743,6 +869,15 @@ class GenerationHandler:
 
                                         if not post_id:
                                             raise Exception("Failed to get post ID from publish API")
+
+                                        try:
+                                            await self.db.update_task_post_id(task_id, post_id)
+                                        except Exception as db_error:
+                                            debug_logger.log_error(
+                                                error_message=f"Failed to persist post_id for task {task_id}: {str(db_error)}",
+                                                status_code=500,
+                                                response_text=str(db_error),
+                                            )
 
                                         # Decide which parse server to use based on config:
                                         # - third_party: 默认使用 sorai.me/get-sora-link，或使用自定义 URL
@@ -856,7 +991,15 @@ class GenerationHandler:
                                         # Use downloadable_url instead of url
                                         url = item.get("downloadable_url") or item.get("url")
                                         if not url:
-                                            raise Exception("Video URL not found")
+                                            error_message = "Video URL not found in draft item (watermark-free fallback)"
+                                            await self.db.update_task(
+                                                task_id,
+                                                "failed",
+                                                100.0,
+                                                error_message=error_message,
+                                                post_id=post_id,
+                                            )
+                                            raise TerminalTaskError(error_message)
                                         if config.cache_enabled:
                                             try:
                                                 cached_filename = await self.file_cache.download_and_cache(url, "video")
@@ -869,7 +1012,14 @@ class GenerationHandler:
                                     # Normal mode: use downloadable_url instead of url
                                     url = item.get("downloadable_url") or item.get("url")
                                     if not url:
-                                        raise Exception("Video URL not found")
+                                        error_message = "Video URL not found in draft item"
+                                        await self.db.update_task(
+                                            task_id,
+                                            "failed",
+                                            100.0,
+                                            error_message=error_message,
+                                        )
+                                        raise TerminalTaskError(error_message)
 
                                     # Cache video file (if cache enabled)
                                     if config.cache_enabled:
@@ -1062,6 +1212,8 @@ class GenerationHandler:
                                 reasoning_content=f"**Processing**\n\nGeneration in progress: {estimated_progress:.0f}% completed (estimated)...\n"
                             )
             
+            except TerminalTaskError:
+                raise
             except Exception as e:
                 if attempt >= max_attempts - 1:
                     raise e

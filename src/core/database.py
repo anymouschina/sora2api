@@ -1056,6 +1056,22 @@ class Database:
                 WHERE task_id = ?
             """, (status, progress, result_urls, error_message, completed_at, post_id, task_id))
             await db.commit()
+
+    async def update_task_post_id(self, task_id: str, post_id: str):
+        """Update task post_id without touching other fields."""
+        async with self._connect() as db:
+            await db.execute(
+                """
+                UPDATE tasks
+                SET post_id = CASE
+                    WHEN post_id IS NULL OR post_id = '' THEN ?
+                    ELSE post_id
+                END
+                WHERE task_id = ?
+                """,
+                (post_id, task_id),
+            )
+            await db.commit()
     
     async def get_task(self, task_id: str) -> Optional[Task]:
         """Get task by ID"""

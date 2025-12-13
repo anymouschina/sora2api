@@ -4,17 +4,17 @@ admin_username = "admin"
 admin_password = "admin"
 
 [sora]
-base_url = "https://sora2.beqlee.icu/backend"
+base_url = "https://sora.chatgpt.com/backend"
 # Frontend/base host for Sora (used for Origin/Referer and share URLs).
 # For example, if you route through a Cloudflare Worker at sora2.example.com,
 # you can set:
 #   front_base_url = "https://sora2.example.com"
 # and adjust base_url accordingly, e.g. "https://sora2.example.com/backend".
-front_base_url = "https://sora2.beqlee.icu"
+front_base_url = "https://sora.chatgpt.com"
 
 # Base URL for OpenAI auth endpoints (RT->AT). Can be pointed to a reverse
 # proxy (e.g. Cloudflare Worker) if needed.
-auth_base_url = "https://auth.beqlee.icu"
+auth_base_url = "https://auth.chatgpt.com"
 timeout = 120
 max_retries = 3
 poll_interval = 2.5

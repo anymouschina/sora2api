@@ -13,6 +13,14 @@ from .proxy_manager import ProxyManager
 from ..core.config import config
 from ..core.logger import debug_logger
 
+class SoraAPIError(Exception):
+    def __init__(self, status_code: int, response_text: str, response_json: Any = None, url: str = ""):
+        self.status_code = status_code
+        self.response_text = response_text
+        self.response_json = response_json
+        self.url = url
+        super().__init__(f"API request failed: {status_code} - {response_text}")
+
 class SoraClient:
     """Sora API client with proxy support"""
 
@@ -172,7 +180,12 @@ class SoraClient:
                     status_code=response.status_code,
                     response_text=response.text
                 )
-                raise Exception(error_msg)
+                raise SoraAPIError(
+                    status_code=response.status_code,
+                    response_text=response.text,
+                    response_json=response_json,
+                    url=url,
+                )
 
             return response_json if response_json else response.json()
     
