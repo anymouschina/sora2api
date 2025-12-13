@@ -710,11 +710,13 @@ class GenerationHandler:
                                 # Check if watermark-free mode is enabled
                                 watermark_free_config = await self.db.get_watermark_free_config()
                                 watermark_free_enabled = watermark_free_config.watermark_free_enabled
+                                post_id: Optional[str] = None
+                                generation_id = item.get("id")
+                                remove_watermark = False
 
                                 if watermark_free_enabled:
                                     # Watermark-free mode: post video and use parser to get watermark-free URL
                                     debug_logger.log_info(f"Entering watermark-free mode for task {task_id}")
-                                    generation_id = item.get("id")
                                     debug_logger.log_info(f"Generation ID: {generation_id}")
                                     if not generation_id:
                                         raise Exception("Generation ID not found in video draft")
@@ -838,6 +840,8 @@ class GenerationHandler:
                                                     reasoning_content="Cache is disabled. Using watermark-free URL directly...\n"
                                                 )
 
+                                        remove_watermark = True
+
                                     except Exception as publish_error:
                                         # Fallback to normal mode if publish fails
                                         debug_logger.log_error(
@@ -864,40 +868,49 @@ class GenerationHandler:
                                 else:
                                     # Normal mode: use downloadable_url instead of url
                                     url = item.get("downloadable_url") or item.get("url")
-                                    if url:
-                                        # Cache video file (if cache enabled)
-                                        if config.cache_enabled:
+                                    if not url:
+                                        raise Exception("Video URL not found")
+
+                                    # Cache video file (if cache enabled)
+                                    if config.cache_enabled:
+                                        if stream:
+                                            yield self._format_stream_chunk(
+                                                reasoning_content="**Video Generation Completed**\n\nVideo generation successful. Now caching the video file...\n"
+                                            )
+
+                                        try:
+                                            cached_filename = await self.file_cache.download_and_cache(url, "video")
+                                            local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
                                             if stream:
                                                 yield self._format_stream_chunk(
-                                                    reasoning_content="**Video Generation Completed**\n\nVideo generation successful. Now caching the video file...\n"
+                                                    reasoning_content="Video file cached successfully. Preparing final response...\n"
                                                 )
-
-                                            try:
-                                                cached_filename = await self.file_cache.download_and_cache(url, "video")
-                                                local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
-                                                if stream:
-                                                    yield self._format_stream_chunk(
-                                                        reasoning_content="Video file cached successfully. Preparing final response...\n"
-                                                    )
-                                            except Exception as cache_error:
-                                                # Fallback to original URL if caching fails
-                                                local_url = url
-                                                if stream:
-                                                    yield self._format_stream_chunk(
-                                                        reasoning_content=f"Warning: Failed to cache file - {str(cache_error)}\nUsing original URL instead...\n"
-                                                    )
-                                        else:
-                                            # Cache disabled: use original URL directly
+                                        except Exception as cache_error:
+                                            # Fallback to original URL if caching fails
                                             local_url = url
                                             if stream:
                                                 yield self._format_stream_chunk(
-                                                    reasoning_content="**Video Generation Completed**\n\nCache is disabled. Using original URL directly...\n"
+                                                    reasoning_content=f"Warning: Failed to cache file - {str(cache_error)}\nUsing original URL instead...\n"
                                                 )
+                                    else:
+                                        # Cache disabled: use original URL directly
+                                        local_url = url
+                                        if stream:
+                                            yield self._format_stream_chunk(
+                                                reasoning_content="**Video Generation Completed**\n\nCache is disabled. Using original URL directly...\n"
+                                            )
 
                                 # Task completed
                                 await self.db.update_task(
                                     task_id, "completed", 100.0,
-                                    result_urls=json.dumps([local_url])
+                                    result_urls=json.dumps([
+                                        {
+                                            "url": local_url,
+                                            "pid": generation_id,
+                                            "removeWatermark": remove_watermark,
+                                        }
+                                    ]),
+                                    post_id=post_id,
                                 )
 
                                 if stream:

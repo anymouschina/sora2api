@@ -1,0 +1,39 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sora2api",
+  "main": "worker/index.ts",
+  "compatibility_date": "2025-12-12",
+
+  "containers": [
+    {
+      "class_name": "SoraApi",
+      "image": "./Dockerfile",
+      "max_instances": 3
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "SORA_API", "class_name": "SoraApi" }
+    ]
+  },
+
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SoraApi"] }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "sora2api",
+      "database_id": "142f672d-4a00-4a4f-8856-0801833174d6"
+    }
+  ],
+
+  "vars": {
+    "SORA2API_API_KEY": "han1234",
+    "D1_PROXY_BASE_URL": "https://sora2api.beqlee.icu/__d1"
+  },
+
+  "observability": { "enabled": true }
+}

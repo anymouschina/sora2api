@@ -242,6 +242,7 @@ async def get_video_task(
 
     return {
         "id": task.task_id,
+        "post_id": task.post_id,
         "status": status,
         "progress": progress,
         "video_url": video_url,

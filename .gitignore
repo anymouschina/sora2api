@@ -46,6 +46,11 @@ Thumbs.db
 # Logs
 *.log
 
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
 # Environment
 .env
 .env.local

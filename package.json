@@ -1,0 +1,13 @@
+{
+  "name": "sora2api-worker",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@cloudflare/containers": "^0.0.30"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250430.0",
+    "wrangler": "^4.20.3",
+    "typescript": "^5.6.3"
+  }
+}

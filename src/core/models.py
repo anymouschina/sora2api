@@ -60,6 +60,7 @@ class Task(BaseModel):
     prompt: str
     status: str = "processing"  # processing/completed/failed
     progress: float = 0.0
+    post_id: Optional[str] = None
     result_urls: Optional[str] = None  # JSON array
     error_message: Optional[str] = None
     created_at: Optional[datetime] = None
