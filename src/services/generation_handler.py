@@ -8,6 +8,7 @@ import re
 import os
 from uuid import uuid4
 from typing import Optional, AsyncGenerator, Dict, Any
+from urllib.parse import urlparse
 from datetime import datetime
 from .sora_client import SoraClient, SoraAPIError
 from .token_manager import TokenManager
@@ -199,7 +200,14 @@ class GenerationHandler:
             )
         return False
 
-    async def create_video_task(self, model: str, prompt: str, remix_target_id: Optional[str] = None) -> str:
+    async def create_video_task(
+        self,
+        model: str,
+        prompt: str,
+        remix_target_id: Optional[str] = None,
+        image: Optional[str] = None,
+        size: str = "small",
+    ) -> str:
         """Create a video generation task and poll it in background.
 
         面向 TapCanvas 这类上游：返回 taskId，前端只需轮询本服务的
@@ -220,6 +228,26 @@ class GenerationHandler:
         n_frames = model_config.get("n_frames", 300)
         orientation = model_config.get("orientation", "landscape")
         clean_prompt = self._clean_remix_link_from_prompt(prompt) if remix_target_id else prompt
+        video_size = (size or "small").lower()
+        if video_size not in ["small", "large"]:
+            video_size = "small"
+
+        image_bytes: Optional[bytes] = None
+        image_filename = "image.png"
+        if image:
+            image_str = image.strip()
+            if image_str:
+                try:
+                    if image_str.startswith("http"):
+                        image_bytes = await self._download_file(image_str)
+                        parsed = urlparse(image_str)
+                        candidate = parsed.path.rsplit("/", 1)[-1] if parsed.path else ""
+                        if candidate:
+                            image_filename = candidate
+                    else:
+                        image_bytes = self._decode_base64_image(image_str)
+                except Exception as img_error:
+                    raise Exception(f"Failed to process reference image: {str(img_error)}")
 
         for _ in range(max_token_attempts):
             token_obj = await self.load_balancer.select_token(for_image_generation=False, for_video_generation=True)
@@ -242,6 +270,14 @@ class GenerationHandler:
             task_id: Optional[str] = None
             try:
                 async def _create_with_token(access_token: str) -> str:
+                    media_id = None
+                    if image_bytes and not remix_target_id:
+                        media_id = await self.sora_client.upload_image(
+                            image_bytes,
+                            access_token,
+                            filename=image_filename,
+                        )
+
                     if remix_target_id:
                         return await self.sora_client.remix_video(
                             remix_target_id=remix_target_id,
@@ -249,6 +285,7 @@ class GenerationHandler:
                             token=access_token,
                             orientation=orientation,
                             n_frames=n_frames,
+                            size=video_size,
                         )
 
                     if self.sora_client.is_storyboard_prompt(prompt):
@@ -258,15 +295,17 @@ class GenerationHandler:
                             formatted_prompt,
                             access_token,
                             orientation=orientation,
-                            media_id=None,
+                            media_id=media_id,
                             n_frames=n_frames,
+                            size=video_size,
                         )
                     return await self.sora_client.generate_video(
                         prompt,
                         access_token,
                         orientation=orientation,
-                        media_id=None,
+                        media_id=media_id,
                         n_frames=n_frames,
+                        size=video_size,
                     )
 
                 task_access_token = token_obj.token

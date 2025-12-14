@@ -335,8 +335,15 @@ class SoraClient:
         result = await self._make_request("POST", "/video_gen", token, json_data=json_data, add_sentinel_token=True)
         return result["id"]
     
-    async def generate_video(self, prompt: str, token: str, orientation: str = "landscape",
-                            media_id: Optional[str] = None, n_frames: int = 450) -> str:
+    async def generate_video(
+        self,
+        prompt: str,
+        token: str,
+        orientation: str = "landscape",
+        media_id: Optional[str] = None,
+        n_frames: int = 450,
+        size: str = "small",
+    ) -> str:
         """Generate video (text-to-video or image-to-video)"""
         inpaint_items = []
         if media_id:
@@ -345,11 +352,15 @@ class SoraClient:
                 "upload_id": media_id
             }]
 
+        normalized_size = (size or "small").lower()
+        if normalized_size not in ["small", "large"]:
+            normalized_size = "small"
+
         json_data = {
             "kind": "video",
             "prompt": prompt,
             "orientation": orientation,
-            "size": "small",
+            "size": normalized_size,
             "n_frames": n_frames,
             "model": "sy_8",
             "inpaint_items": inpaint_items
@@ -742,8 +753,15 @@ class SoraClient:
                 raise Exception(f"Failed to delete character: {response.status_code}")
             return True
 
-    async def remix_video(self, remix_target_id: str, prompt: str, token: str,
-                         orientation: str = "portrait", n_frames: int = 450) -> str:
+    async def remix_video(
+        self,
+        remix_target_id: str,
+        prompt: str,
+        token: str,
+        orientation: str = "portrait",
+        n_frames: int = 450,
+        size: str = "small",
+    ) -> str:
         """Generate video using remix (based on existing video)
 
         Args:
@@ -756,6 +774,10 @@ class SoraClient:
         Returns:
             task_id
         """
+        normalized_size = (size or "small").lower()
+        if normalized_size not in ["small", "large"]:
+            normalized_size = "small"
+
         json_data = {
             "kind": "video",
             "prompt": prompt,
@@ -765,14 +787,22 @@ class SoraClient:
             "cameo_replacements": {},
             "model": "sy_8",
             "orientation": orientation,
-            "n_frames": n_frames
+            "n_frames": n_frames,
+            "size": normalized_size
         }
 
         result = await self._make_request("POST", "/nf/create", token, json_data=json_data, add_sentinel_token=True)
         return result.get("id")
 
-    async def generate_storyboard(self, prompt: str, token: str, orientation: str = "landscape",
-                                 media_id: Optional[str] = None, n_frames: int = 450) -> str:
+    async def generate_storyboard(
+        self,
+        prompt: str,
+        token: str,
+        orientation: str = "landscape",
+        media_id: Optional[str] = None,
+        n_frames: int = 450,
+        size: str = "small",
+    ) -> str:
         """Generate video using storyboard mode
 
         Args:
@@ -792,12 +822,16 @@ class SoraClient:
                 "upload_id": media_id
             }]
 
+        normalized_size = (size or "small").lower()
+        if normalized_size not in ["small", "large"]:
+            normalized_size = "small"
+
         json_data = {
             "kind": "video",
             "prompt": prompt,
             "title": "Draft your video",
             "orientation": orientation,
-            "size": "small",
+            "size": normalized_size,
             "n_frames": n_frames,
             "storyboard_id": None,
             "inpaint_items": inpaint_items,

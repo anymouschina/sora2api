@@ -1,15 +1,17 @@
 """API routes - OpenAI compatible endpoints"""
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile, File, Form, Header
 from fastapi.responses import StreamingResponse, JSONResponse
-from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import json
 import re
+import time
 from ..core.auth import verify_api_key_header
 from ..core.config import config
 from ..core.models import ChatCompletionRequest, Task as DbTask
 from ..core.database import Database
 from ..services.generation_handler import GenerationHandler, MODEL_CONFIG
+from ..core.logger import debug_logger
 
 router = APIRouter()
 
@@ -221,6 +223,192 @@ def _format_character_task(task: DbTask):
         }]
     return payload
 
+def _build_failure_reason(error_message: Optional[str]) -> str:
+    """Map error message to a simple failure reason code."""
+    if not error_message:
+        return ""
+    lowered = error_message.lower()
+    if "input" in lowered and "moderation" in lowered:
+        return "input_moderation"
+    if "output" in lowered and "moderation" in lowered:
+        return "output_moderation"
+    if "content blocked" in lowered:
+        return "output_moderation"
+    return "error"
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    """Coerce incoming payload value to boolean."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in ["1", "true", "yes", "on"]
+    return bool(value)
+
+def _format_sora2_video_payload(task: DbTask) -> Dict[str, Any]:
+    """Format DB task into Sora2 video API response payload."""
+    raw_status = (task.status or "").lower()
+    if raw_status in ["completed", "succeeded"]:
+        status = "succeeded"
+    elif raw_status in ["failed", "error"]:
+        status = "failed"
+    else:
+        status = "running"
+
+    progress_raw = task.progress or 0
+    progress = int(progress_raw * 100) if progress_raw <= 1 else int(progress_raw)
+    progress = max(0, min(progress, 100))
+
+    results: List[Dict[str, Any]] = []
+    if task.result_urls:
+        try:
+            parsed = json.loads(task.result_urls)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, str):
+                        url_val = item.strip()
+                        if url_val:
+                            results.append({
+                                "url": url_val,
+                                "removeWatermark": False,
+                                "pid": task.post_id
+                            })
+                    elif isinstance(item, dict):
+                        url_val = item.get("url")
+                        if url_val:
+                            results.append({
+                                "url": url_val,
+                                "removeWatermark": bool(item.get("removeWatermark", False)),
+                                "pid": item.get("pid") or task.post_id
+                            })
+        except Exception:
+            # Ignore malformed JSON, fallback to empty results
+            pass
+
+    failure_reason = _build_failure_reason(task.error_message) if status == "failed" else ""
+
+    return {
+        "id": task.task_id,
+        "results": results,
+        "progress": progress,
+        "status": status,
+        "failure_reason": failure_reason,
+        "error": task.error_message or ""
+    }
+
+async def _stream_sora2_video(task_id: str, shut_progress: bool = False):
+    """Server-sent events stream for Sora2 video tasks."""
+    db: Database = generation_handler.db  # type: ignore[attr-defined]
+    poll_interval = max(float(config.poll_interval), 1.0)
+
+    while True:
+        task = await db.get_task(task_id)
+        if not task:
+            error_payload = {
+                "id": task_id,
+                "results": [],
+                "progress": 0,
+                "status": "failed",
+                "failure_reason": "error",
+                "error": "Task not found"
+            }
+            yield f"data: {json.dumps(error_payload)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        payload = _format_sora2_video_payload(task)
+        is_final = payload["status"] in ["succeeded", "failed"]
+
+        if not shut_progress or is_final:
+            yield f"data: {json.dumps(payload)}\n\n"
+
+        if is_final:
+            yield "data: [DONE]\n\n"
+            return
+
+        await asyncio.sleep(poll_interval)
+
+async def _post_webhook_payload(web_hook: str, payload: Dict[str, Any]):
+    """Send webhook payload with basic error logging."""
+    from curl_cffi.requests import AsyncSession
+
+    try:
+        async with AsyncSession() as session:
+            await session.post(
+                web_hook,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                impersonate="chrome",
+                timeout=20,
+            )
+    except Exception as exc:
+        debug_logger.log_error(
+            error_message=f"Failed to POST webhook to {web_hook}: {str(exc)}",
+            status_code=500,
+            response_text=str(exc),
+        )
+
+async def _dispatch_webhook_updates(task_id: str, web_hook: str, shut_progress: bool = False):
+    """Poll task status and dispatch updates to webhook."""
+    if generation_handler is None:
+        return
+
+    db: Database = generation_handler.db  # type: ignore[attr-defined]
+    poll_interval = max(float(config.poll_interval), 1.0)
+    last_progress: Optional[int] = None
+
+    try:
+        while True:
+            task = await db.get_task(task_id)
+            if not task:
+                await _post_webhook_payload(web_hook, {
+                    "id": task_id,
+                    "results": [],
+                    "progress": 0,
+                    "status": "failed",
+                    "failure_reason": "error",
+                    "error": "Task not found"
+                })
+                return
+
+            payload = _format_sora2_video_payload(task)
+            is_final = payload["status"] in ["succeeded", "failed"]
+            should_send = (not shut_progress or is_final)
+
+            if should_send:
+                if is_final or last_progress is None or payload["progress"] != last_progress:
+                    await _post_webhook_payload(web_hook, payload)
+
+            if is_final:
+                return
+
+            last_progress = payload["progress"]
+            await asyncio.sleep(poll_interval)
+    except Exception as exc:
+        debug_logger.log_error(
+            error_message=f"Webhook dispatcher failed for task {task_id}: {str(exc)}",
+            status_code=500,
+            response_text=str(exc),
+        )
+
+async def _get_sora2_task_response(task_id: str) -> Dict[str, Any]:
+    """Fetch task from DB, refresh progress once, and format payload."""
+    if generation_handler is None:
+        raise HTTPException(status_code=500, detail="Generation handler not initialized")
+
+    db: Database = generation_handler.db  # type: ignore[attr-defined]
+    task = await db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    try:
+        refreshed_task, _ = await generation_handler.refresh_video_task_progress(task)  # type: ignore[attr-defined]
+        task = refreshed_task or task
+    except Exception:
+        # Ignore refresh errors, fallback to current DB state
+        pass
+
+    return _format_sora2_video_payload(task)
+
 @router.get("/v1/models")
 async def list_models(api_key: str = Depends(verify_api_key_header)):
     """List available models"""
@@ -321,7 +509,15 @@ async def _create_video_task_common(body: dict):
     if generation_handler is None:
         raise HTTPException(status_code=500, detail="Generation handler not initialized")
 
-    model, prompt, remix_target_id = _normalize_video_task_request(body)
+    body_with_defaults = dict(body) if isinstance(body, dict) else {}
+    if (
+        "aspectRatio" not in body_with_defaults
+        and "aspect_ratio" not in body_with_defaults
+        and "orientation" not in body_with_defaults
+    ):
+        body_with_defaults["aspectRatio"] = "9:16"
+
+    model, prompt, remix_target_id = _normalize_video_task_request(body_with_defaults)
 
     try:
         task_id = await generation_handler.create_video_task(
@@ -344,11 +540,8 @@ async def _create_video_task_common(body: dict):
 
 @router.post("/v1/video/tasks")
 @router.post("/v1/video/sora")
-@router.post("/v1/video/sora-video")
 @router.post("/client/v1/video/sora")
-@router.post("/client/v1/video/sora-video")
 @router.post("/client/video/sora")
-@router.post("/client/video/sora-video")
 async def create_video_task(
     body: dict,
     api_key: str = Depends(verify_api_key_header),
@@ -361,6 +554,96 @@ async def create_video_task(
     """
     return await _create_video_task_common(body)
 
+@router.post("/v1/video/sora-video")
+@router.post("/client/v1/video/sora-video")
+@router.post("/client/video/sora-video")
+async def create_sora2_video_task(
+    body: dict,
+    api_key: str = Depends(verify_api_key_header),
+):
+    """Sora2 video endpoint with stream/webhook support."""
+    if generation_handler is None:
+        raise HTTPException(status_code=500, detail="Generation handler not initialized")
+
+    model, prompt, remix_target_id = _normalize_video_task_request(body)
+
+    # Payload fields
+    reference_url_raw = body.get("url") or ""
+    reference_url = reference_url_raw.strip() if isinstance(reference_url_raw, str) else str(reference_url_raw)
+    web_hook_raw = body.get("webHook")
+    web_hook = web_hook_raw.strip() if isinstance(web_hook_raw, str) else (str(web_hook_raw).strip() if web_hook_raw is not None else "")
+    shut_progress = _to_bool(body.get("shutProgress"), False)
+    stream = _to_bool(body.get("stream"), True)
+    size_raw = body.get("size") or "small"
+    size = "large" if str(size_raw).lower() == "large" else "small"
+
+    try:
+        task_id = await generation_handler.create_video_task(
+            model=model,
+            prompt=prompt,
+            remix_target_id=remix_target_id,
+            image=reference_url or None,
+            size=size,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Webhook mode (ack then push updates)
+    if web_hook:
+        if web_hook != "-1":
+            asyncio.create_task(_dispatch_webhook_updates(task_id, web_hook, shut_progress))
+        return {
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "id": task_id
+            }
+        }
+
+    # Polling mode (immediate payload)
+    if not stream:
+        db: Database = generation_handler.db  # type: ignore[attr-defined]
+        task = await db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return _format_sora2_video_payload(task)
+
+    async def event_stream():
+        async for chunk in _stream_sora2_video(task_id, shut_progress):
+            yield chunk
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+@router.get("/v1/video/sora-video/{task_id}")
+async def get_sora2_video_task(
+    task_id: str = Path(..., description="Sora video task id"),
+    api_key: str = Depends(verify_api_key_header),
+):
+    """Get Sora2 video task progress/result in unified format."""
+    return await _get_sora2_task_response(task_id)
+
+@router.post("/v1/video/sora-video/result")
+async def get_sora2_video_result(
+    body: dict,
+    api_key: str = Depends(verify_api_key_header),
+):
+    """Polling endpoint for Sora2 video tasks (body: {\"id\": \"...\"})."""
+    task_id_raw = body.get("id") or body.get("taskId") or body.get("task_id") or ""
+    task_id = str(task_id_raw).strip()
+    if not task_id:
+        raise HTTPException(status_code=400, detail="id is required")
+    return await _get_sora2_task_response(task_id)
+
 @router.post("/v1/video/sora-upload-character")
 @router.post("/client/v1/video/sora-upload-character")
 @router.post("/client/video/sora-upload-character")
@@ -368,7 +651,10 @@ async def upload_character(
     body: dict,
     api_key: str = Depends(verify_api_key_header),
 ):
-    """Trigger character creation from a video URL (non-stream)."""
+    """Trigger character creation from a video URL (non-blocking by default).
+
+    Optional: pass wait=true to block until completion.
+    """
     if generation_handler is None:
         raise HTTPException(status_code=500, detail="Generation handler not initialized")
 
@@ -376,14 +662,38 @@ async def upload_character(
     if not video_url:
         raise HTTPException(status_code=400, detail="url is required")
 
+    wait_for_result = _to_bool(body.get("wait"), False)
+
     try:
         task_id = await generation_handler.create_character_task(video_url, is_pid=False)
-        return {
-            "id": task_id,
-            "taskId": task_id,
-            "status": "running",
-            "progress": 0,
-        }
+
+        if not wait_for_result:
+            return {
+                "id": task_id,
+                "taskId": task_id,
+                "status": "running",
+                "progress": 0,
+            }
+
+        # Wait for completion (poll DB)
+        db: Database = generation_handler.db  # type: ignore[attr-defined]
+        timeout = max(getattr(config, "video_timeout", 600), 60)
+        start = time.time()
+        poll_interval = 2.0
+
+        while True:
+            task = await db.get_task(task_id)
+            if task:
+                status_lower = (task.status or "").lower()
+                if status_lower in ["completed", "succeeded"]:
+                    return _format_character_task(task)
+                if status_lower in ["failed", "error"]:
+                    raise HTTPException(status_code=500, detail=task.error_message or "Character creation failed")
+
+            if time.time() - start > timeout:
+                raise HTTPException(status_code=504, detail="Character creation timed out")
+
+            await asyncio.sleep(poll_interval)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
