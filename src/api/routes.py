@@ -295,6 +295,30 @@ def _format_sora2_video_payload(task: DbTask) -> Dict[str, Any]:
         "error": task.error_message or ""
     }
 
+def _normalize_video_task_request_extended(
+    raw_body: dict,
+    apply_default_portrait: bool = False
+) -> tuple[str, str, Optional[str], str, str]:
+    """Normalize video request with optional defaults and extract reference image/size."""
+    body = dict(raw_body) if isinstance(raw_body, dict) else {}
+
+    if apply_default_portrait and (
+        "aspectRatio" not in body and "aspect_ratio" not in body and "orientation" not in body
+    ):
+        body["aspectRatio"] = "9:16"
+
+    model, prompt, remix_target_id = _normalize_video_task_request(body)
+
+    reference_url_raw = body.get("url")
+    reference_url = reference_url_raw.strip() if isinstance(reference_url_raw, str) else (
+        str(reference_url_raw).strip() if reference_url_raw is not None else ""
+    )
+
+    size_raw = body.get("size") or "small"
+    size = "large" if str(size_raw).lower() == "large" else "small"
+
+    return model, prompt, remix_target_id, reference_url, size
+
 async def _stream_sora2_video(task_id: str, shut_progress: bool = False):
     """Server-sent events stream for Sora2 video tasks."""
     db: Database = generation_handler.db  # type: ignore[attr-defined]
@@ -509,21 +533,18 @@ async def _create_video_task_common(body: dict):
     if generation_handler is None:
         raise HTTPException(status_code=500, detail="Generation handler not initialized")
 
-    body_with_defaults = dict(body) if isinstance(body, dict) else {}
-    if (
-        "aspectRatio" not in body_with_defaults
-        and "aspect_ratio" not in body_with_defaults
-        and "orientation" not in body_with_defaults
-    ):
-        body_with_defaults["aspectRatio"] = "9:16"
-
-    model, prompt, remix_target_id = _normalize_video_task_request(body_with_defaults)
+    model, prompt, remix_target_id, reference_url, size = _normalize_video_task_request_extended(
+        body,
+        apply_default_portrait=True,
+    )
 
     try:
         task_id = await generation_handler.create_video_task(
             model=model,
             prompt=prompt,
             remix_target_id=remix_target_id,
+            image=reference_url or None,
+            size=size,
         )
         response = {
             "id": task_id,
@@ -565,17 +586,16 @@ async def create_sora2_video_task(
     if generation_handler is None:
         raise HTTPException(status_code=500, detail="Generation handler not initialized")
 
-    model, prompt, remix_target_id = _normalize_video_task_request(body)
+    model, prompt, remix_target_id, reference_url, size = _normalize_video_task_request_extended(
+        body,
+        apply_default_portrait=True,
+    )
 
     # Payload fields
-    reference_url_raw = body.get("url") or ""
-    reference_url = reference_url_raw.strip() if isinstance(reference_url_raw, str) else str(reference_url_raw)
     web_hook_raw = body.get("webHook")
     web_hook = web_hook_raw.strip() if isinstance(web_hook_raw, str) else (str(web_hook_raw).strip() if web_hook_raw is not None else "")
     shut_progress = _to_bool(body.get("shutProgress"), False)
     stream = _to_bool(body.get("stream"), True)
-    size_raw = body.get("size") or "small"
-    size = "large" if str(size_raw).lower() == "large" else "small"
 
     try:
         task_id = await generation_handler.create_video_task(
