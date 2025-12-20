@@ -18,6 +18,12 @@ from .services.concurrency_manager import ConcurrencyManager
 from .api import routes as api_routes
 from .api import admin as admin_routes
 from .api import downloader as downloader_routes
+from .api import gemini_admin as gemini_admin_routes
+from .gemini.database import GeminiDatabase
+from .gemini.flow_client import FlowClient
+from .gemini.token_manager import GeminiTokenManager
+from .gemini.load_balancer import GeminiLoadBalancer
+from .gemini.generation_handler import GeminiGenerationHandler
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -44,15 +50,33 @@ load_balancer = LoadBalancer(token_manager, concurrency_manager)
 sora_client = SoraClient(proxy_manager)
 generation_handler = GenerationHandler(sora_client, token_manager, load_balancer, db, proxy_manager, concurrency_manager)
 
+# Gemini/Flow components (separate DB tables and separate concurrency manager)
+gemini_db = GeminiDatabase(db_path=db.db_path)
+gemini_flow_client = FlowClient(proxy_manager)
+gemini_token_manager = GeminiTokenManager(gemini_db, gemini_flow_client)
+gemini_concurrency_manager = ConcurrencyManager()
+gemini_load_balancer = GeminiLoadBalancer(gemini_token_manager, gemini_concurrency_manager)
+gemini_generation_handler = GeminiGenerationHandler(
+    gemini_flow_client,
+    gemini_token_manager,
+    gemini_load_balancer,
+    gemini_db,
+    gemini_concurrency_manager,
+    proxy_manager,
+)
+
 # Set dependencies for route modules
 api_routes.set_generation_handler(generation_handler)
+api_routes.set_gemini_generation_handler(gemini_generation_handler)
 admin_routes.set_dependencies(token_manager, proxy_manager, db, generation_handler, concurrency_manager)
 downloader_routes.set_dependencies(token_manager, proxy_manager)
+gemini_admin_routes.set_dependencies(gemini_token_manager, gemini_db)
 
 # Include routers
 app.include_router(api_routes.router)
 app.include_router(admin_routes.router)
 app.include_router(downloader_routes.router)
+app.include_router(gemini_admin_routes.router, prefix="/gemini")
 
 # Static files
 static_dir = Path(__file__).parent.parent / "static"
@@ -90,6 +114,11 @@ async def manage_page():
     """Serve management page"""
     return FileResponse(str(static_dir / "manage.html"))
 
+@app.get("/manage-gemini", response_class=FileResponse)
+async def manage_gemini_page():
+    """Serve Gemini management page"""
+    return FileResponse(str(static_dir / "manage_gemini.html"))
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize database on startup"""
@@ -101,11 +130,24 @@ async def startup_event():
 
     # Initialize database tables
     await db.init_db()
+    await gemini_db.init_db()
 
     # Handle database initialization based on startup type
     if is_first_startup:
         print("🎉 First startup detected. Initializing database and configuration from setting.toml...")
         await db.init_config_from_toml(config_dict, is_first_startup=True)
+        # Initialize captcha_config for Gemini/Flow from setting.toml if provided
+        try:
+            captcha_cfg = (config_dict or {}).get("captcha", {}) or {}
+            await gemini_db.update_captcha_config(
+                captcha_method=str(captcha_cfg.get("captcha_method", "browser")),
+                yescaptcha_api_key=str(captcha_cfg.get("yescaptcha_api_key", "") or ""),
+                yescaptcha_base_url=str(captcha_cfg.get("yescaptcha_base_url", "https://api.yescaptcha.com") or "https://api.yescaptcha.com"),
+                browser_proxy_enabled=bool(captcha_cfg.get("browser_proxy_enabled", False)),
+                browser_proxy_url=str(captcha_cfg.get("browser_proxy_url", "") or "") or None,
+            )
+        except Exception:
+            pass
         print("✓ Database and configuration initialized successfully.")
     else:
         print("🔄 Existing database detected. Checking for missing tables and columns...")
@@ -132,18 +174,36 @@ async def startup_event():
     token_refresh_config = await db.get_token_refresh_config()
     config.set_at_auto_refresh_enabled(token_refresh_config.at_auto_refresh_enabled)
 
+    # Load captcha configuration (for Gemini/Flow) from database
+    try:
+        captcha_config = await gemini_db.get_captcha_config()
+        config.set_captcha_method(captcha_config.captcha_method)
+        config.set_yescaptcha_api_key(captcha_config.yescaptcha_api_key)
+        config.set_yescaptcha_base_url(captcha_config.yescaptcha_base_url)
+        config.set_browser_proxy_enabled(bool(captcha_config.browser_proxy_enabled))
+        config.set_browser_proxy_url(captcha_config.browser_proxy_url or "")
+    except Exception:
+        pass
+
     # Initialize concurrency manager with all tokens
     all_tokens = await db.get_all_tokens()
     await concurrency_manager.initialize(all_tokens)
     print(f"✓ Concurrency manager initialized with {len(all_tokens)} tokens")
 
+    # Initialize Gemini concurrency manager with gemini tokens
+    gemini_tokens = await gemini_db.get_all_tokens()
+    await gemini_concurrency_manager.initialize(gemini_tokens)
+    print(f"✓ Gemini concurrency manager initialized with {len(gemini_tokens)} tokens")
+
     # Start file cache cleanup task
     await generation_handler.file_cache.start_cleanup_task()
+    await gemini_generation_handler.file_cache.start_cleanup_task()
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
     await generation_handler.file_cache.stop_cleanup_task()
+    await gemini_generation_handler.file_cache.stop_cleanup_task()
 
 if __name__ == "__main__":
     uvicorn.run(

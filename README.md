@@ -113,6 +113,10 @@ python main.py
 - **用户名**: `admin`
 - **密码**: `admin`
 
+已合并 Flow2API（Gemini/VideoFX）能力：
+- **Gemini Token 管理**: http://localhost:8000/manage-gemini （与 Sora Token 池完全隔离）
+- **统一 OpenAI 兼容入口**: 仍使用 `POST /v1/chat/completions`，通过 `model` 选择 `sora-*` 或 `gemini/veo/imagen` 系列模型
+
 ⚠️ **重要**: 首次登录后请立即修改密码！
 
 ---
@@ -160,6 +164,11 @@ python main.py
 | `sora-video-landscape-15s` | 15秒 | 横屏 | 文生视频/图生视频 |
 | `sora-video-portrait-10s` | 10秒 | 竖屏 | 文生视频/图生视频 |
 | `sora-video-portrait-15s` | 15秒 | 竖屏 | 文生视频/图生视频 |
+
+**Gemini/Flow 模型（合并自 Flow2API）**
+
+- 图片：`gemini-2.5-flash-image-*` / `gemini-3.0-pro-image-*` / `imagen-4.0-generate-preview-*`
+- 视频：`veo_*`（含 T2V/I2V/R2V）
 
 #### 请求示例
 

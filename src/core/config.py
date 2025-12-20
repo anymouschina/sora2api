@@ -10,6 +10,11 @@ class Config:
         self._config = self._load_config()
         self._admin_username: Optional[str] = None
         self._admin_password: Optional[str] = None
+        self._captcha_method: Optional[str] = None
+        self._yescaptcha_api_key: Optional[str] = None
+        self._yescaptcha_base_url: Optional[str] = None
+        self._browser_proxy_enabled: Optional[bool] = None
+        self._browser_proxy_url: Optional[str] = None
     
     def _load_config(self) -> Dict[str, Any]:
         """Load configuration from setting.toml"""
@@ -82,6 +87,27 @@ class Config:
     @property
     def max_poll_attempts(self) -> int:
         return self._config["sora"]["max_poll_attempts"]
+
+    # Flow / Gemini (VideoFX) configuration
+    @property
+    def flow_labs_base_url(self) -> str:
+        return self._config.get("flow", {}).get("labs_base_url", "https://labs.google/fx/api")
+
+    @property
+    def flow_api_base_url(self) -> str:
+        return self._config.get("flow", {}).get("api_base_url", "https://aisandbox-pa.googleapis.com/v1")
+
+    @property
+    def flow_timeout(self) -> int:
+        return int(self._config.get("flow", {}).get("timeout", 120))
+
+    @property
+    def flow_poll_interval(self) -> float:
+        return float(self._config.get("flow", {}).get("poll_interval", 3.0))
+
+    @property
+    def flow_max_poll_attempts(self) -> int:
+        return int(self._config.get("flow", {}).get("max_poll_attempts", 200))
     
     @property
     def server_host(self) -> str:
@@ -229,6 +255,67 @@ class Config:
         if "token_refresh" not in self._config:
             self._config["token_refresh"] = {}
         self._config["token_refresh"]["at_auto_refresh_enabled"] = enabled
+
+    # Captcha configuration (used by Flow/Gemini)
+    @property
+    def captcha_method(self) -> str:
+        if self._captcha_method is not None:
+            return self._captcha_method
+        return self._config.get("captcha", {}).get("captcha_method", "browser")
+
+    def set_captcha_method(self, method: str):
+        self._captcha_method = method
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["captcha_method"] = method
+
+    @property
+    def yescaptcha_api_key(self) -> str:
+        if self._yescaptcha_api_key is not None:
+            return self._yescaptcha_api_key
+        return self._config.get("captcha", {}).get("yescaptcha_api_key", "")
+
+    def set_yescaptcha_api_key(self, api_key: str):
+        self._yescaptcha_api_key = api_key
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["yescaptcha_api_key"] = api_key
+
+    @property
+    def yescaptcha_base_url(self) -> str:
+        if self._yescaptcha_base_url is not None:
+            return self._yescaptcha_base_url
+        return self._config.get("captcha", {}).get("yescaptcha_base_url", "https://api.yescaptcha.com")
+
+    def set_yescaptcha_base_url(self, base_url: str):
+        self._yescaptcha_base_url = base_url
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["yescaptcha_base_url"] = base_url
+
+    @property
+    def browser_proxy_enabled(self) -> bool:
+        if self._browser_proxy_enabled is not None:
+            return self._browser_proxy_enabled
+        return bool(self._config.get("captcha", {}).get("browser_proxy_enabled", False))
+
+    def set_browser_proxy_enabled(self, enabled: bool):
+        self._browser_proxy_enabled = enabled
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["browser_proxy_enabled"] = enabled
+
+    @property
+    def browser_proxy_url(self) -> str:
+        if self._browser_proxy_url is not None:
+            return self._browser_proxy_url
+        return self._config.get("captcha", {}).get("browser_proxy_url", "")
+
+    def set_browser_proxy_url(self, proxy_url: str):
+        self._browser_proxy_url = proxy_url
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["browser_proxy_url"] = proxy_url
 
 # Global config instance
 config = Config()

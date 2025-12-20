@@ -1,0 +1,29 @@
+.git
+.gitignore
+
+# Local Python venv / caches
+venv
+__pycache__
+.pycache
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.cache
+
+# Node / tooling
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local/runtime artifacts
+data
+tmp
+logs.txt
+*.log
+
+# Editor / OS
+.DS_Store
+.idea
+.vscode

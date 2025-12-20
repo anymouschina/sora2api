@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile, File, F
 from fastapi.responses import StreamingResponse, JSONResponse
 from typing import List, Optional, Dict, Any
 import json
+import base64
 import re
 import time
 from ..core.auth import verify_api_key_header
@@ -11,17 +12,24 @@ from ..core.config import config
 from ..core.models import ChatCompletionRequest, Task as DbTask
 from ..core.database import Database
 from ..services.generation_handler import GenerationHandler, MODEL_CONFIG
+from ..gemini.generation_handler import GeminiGenerationHandler, MODEL_CONFIG as GEMINI_MODEL_CONFIG
 from ..core.logger import debug_logger
 
 router = APIRouter()
 
 # Dependency injection will be set up in main.py
 generation_handler: GenerationHandler = None
+gemini_generation_handler: GeminiGenerationHandler = None
 
 def set_generation_handler(handler: GenerationHandler):
     """Set generation handler instance"""
     global generation_handler
     generation_handler = handler
+
+def set_gemini_generation_handler(handler: GeminiGenerationHandler):
+    """Set gemini generation handler instance"""
+    global gemini_generation_handler
+    gemini_generation_handler = handler
 
 def _extract_remix_id(text: str) -> str:
     """Extract remix ID from text
@@ -438,19 +446,21 @@ async def list_models(api_key: str = Depends(verify_api_key_header)):
     """List available models"""
     models = []
     
-    for model_id, config in MODEL_CONFIG.items():
-        description = f"{config['type'].capitalize()} generation"
-        if config['type'] == 'image':
-            description += f" - {config['width']}x{config['height']}"
+    for model_id, mcfg in MODEL_CONFIG.items():
+        description = f"{mcfg['type'].capitalize()} generation"
+        if mcfg["type"] == "image":
+            description += f" - {mcfg['width']}x{mcfg['height']}"
         else:
-            description += f" - {config['orientation']}"
-        
-        models.append({
-            "id": model_id,
-            "object": "model",
-            "owned_by": "sora2api",
-            "description": description
-        })
+            description += f" - {mcfg.get('orientation', '')}"
+        models.append({"id": model_id, "object": "model", "owned_by": "sora2api", "description": description})
+
+    for model_id, mcfg in GEMINI_MODEL_CONFIG.items():
+        description = f"{mcfg['type'].capitalize()} generation"
+        if mcfg["type"] == "image":
+            description += f" - {mcfg.get('model_name', '')}"
+        else:
+            description += f" - {mcfg.get('model_key', '')}"
+        models.append({"id": model_id, "object": "model", "owned_by": "gemini2api", "description": description})
     
     return {
         "object": "list",
@@ -909,9 +919,73 @@ async def create_chat_completion(
         else:
             raise HTTPException(status_code=400, detail="Invalid content format")
 
-        # Validate model
-        if request.model not in MODEL_CONFIG:
+        is_sora_model = request.model in MODEL_CONFIG
+        is_gemini_model = request.model in GEMINI_MODEL_CONFIG
+
+        if not is_sora_model and not is_gemini_model:
             raise HTTPException(status_code=400, detail=f"Invalid model: {request.model}")
+
+        # Gemini/Flow generation
+        if is_gemini_model:
+            if gemini_generation_handler is None:
+                raise HTTPException(status_code=500, detail="Gemini generation handler not initialized")
+
+            gemini_images: List[bytes] = []
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "image_url":
+                        image_url = item.get("image_url", {}) or {}
+                        url = image_url.get("url", "") or ""
+                        if url.startswith("data:image"):
+                            try:
+                                b64 = url.split("base64,", 1)[1] if "base64," in url else url
+                                gemini_images.append(base64.b64decode(b64))
+                            except Exception:
+                                continue
+
+            if request.image and not gemini_images:
+                img = request.image
+                if img.startswith("data:image") and "base64," in img:
+                    img = img.split("base64,", 1)[1]
+                try:
+                    gemini_images.append(base64.b64decode(img))
+                except Exception:
+                    pass
+
+            if request.stream:
+                async def generate_gemini():
+                    async for chunk in gemini_generation_handler.handle_generation(
+                        model=request.model,
+                        prompt=prompt,
+                        images=gemini_images if gemini_images else None,
+                        stream=True
+                    ):
+                        yield chunk
+
+                return StreamingResponse(
+                    generate_gemini(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no"
+                    }
+                )
+
+            result = None
+            async for chunk in gemini_generation_handler.handle_generation(
+                model=request.model,
+                prompt=prompt,
+                images=gemini_images if gemini_images else None,
+                stream=False
+            ):
+                result = chunk
+            if result:
+                return JSONResponse(content=json.loads(result))
+            raise HTTPException(status_code=500, detail="Generation failed: No response from handler")
+
+        if generation_handler is None:
+            raise HTTPException(status_code=500, detail="Generation handler not initialized")
 
         # Check if this is a video model
         model_config = MODEL_CONFIG[request.model]
