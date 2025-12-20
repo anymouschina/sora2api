@@ -8,6 +8,10 @@
     {
       "class_name": "SoraApi",
       "image": "./Dockerfile",
+      "image_vars": {
+        "APT_DEBIAN_URI": "https://mirrors.aliyun.com/debian",
+        "APT_SECURITY_URI": "https://mirrors.aliyun.com/debian-security"
+      },
       "max_instances": 3
     }
   ],

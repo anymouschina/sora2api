@@ -15,7 +15,11 @@ class FlowClient:
 
     def __init__(self, proxy_manager):
         self.proxy_manager = proxy_manager
-        self.labs_base_url = config.flow_labs_base_url  # https://labs.google/fx/api
+        # Normalize base URL to reduce config foot-guns (some deployments accidentally include '/trpc')
+        labs_base_url = (config.flow_labs_base_url or "").rstrip("/")
+        if labs_base_url.endswith("/trpc"):
+            labs_base_url = labs_base_url[: -len("/trpc")]
+        self.labs_base_url = labs_base_url  # https://labs.google/fx/api
         self.api_base_url = config.flow_api_base_url    # https://aisandbox-pa.googleapis.com/v1
         self.timeout = config.flow_timeout
 
@@ -172,88 +176,124 @@ class FlowClient:
 
     async def st_to_at(self, st: str) -> Dict[str, Any]:
         """ST转AT,并获取用户信息"""
-        url = f"{self.labs_base_url}/trpc/auth.session"
+        normalized_st = self.normalize_session_token(st)
 
-        json_data = {
-            "json": None
-        }
+        def _unwrap_trpc(result: Dict[str, Any]) -> Dict[str, Any]:
+            inner = result.get("result", {}).get("data", {}).get("json")
+            return inner if isinstance(inner, dict) else result
 
-        result = await self._make_request(
-            method="POST",
-            url=url,
-            json_data=json_data,
-            use_st=True,
-            st_token=st
-        )
+        # labs.google 的 session 接口在不同版本可能是：
+        # - REST: GET /auth/session -> {access_token, expires, user}
+        # - tRPC query: GET /trpc/auth.session -> {result:{data:{json:{accessToken,...}}}}
+        #
+        # 注意：用 POST 可能触发 "No \"mutation\"-procedure on path \"auth.session\""。
+        attempts = [
+            ("GET", f"{self.labs_base_url}/auth/session"),
+            ("GET", f"{self.labs_base_url}/trpc/auth.session"),
+        ]
 
-        # 提取accessToken
-        data = result.get("result", {}).get("data", {}).get("json", {})
-        access_token = data.get("accessToken")
-        expires = data.get("expires")
-        user = data.get("user", {})
+        last_error: Exception = None  # type: ignore[assignment]
+        for method, url in attempts:
+            try:
+                raw = await self._make_request(
+                    method=method,
+                    url=url,
+                    use_st=True,
+                    st_token=normalized_st,
+                )
+                data = _unwrap_trpc(raw)
 
-        if not access_token:
-            raise Exception("ST转AT失败: 未获取到accessToken")
+                access_token = data.get("access_token") or data.get("accessToken")
+                expires = data.get("expires")
+                user = data.get("user", {}) or {}
 
-        return {
-            "access_token": access_token,
-            "expires": expires,
-            "user": user
-        }
+                if access_token:
+                    return {"access_token": access_token, "expires": expires, "user": user}
+
+                raise Exception("ST转AT失败: 未获取到access_token/accessToken")
+            except Exception as e:
+                last_error = e
+
+        raise last_error
 
     # ========== Credits查询 ==========
 
     async def get_credits(self, at: str) -> Dict[str, Any]:
         """查询VideoFX credits余额"""
-        url = f"{self.labs_base_url}/trpc/videoFx.credits"
-
-        json_data = {
-            "json": None
-        }
-
-        result = await self._make_request(
-            method="POST",
-            url=url,
-            json_data=json_data,
-            use_at=True,
-            at_token=at
-        )
-
-        data = result.get("result", {}).get("data", {}).get("json", {})
-
-        return {
-            "credits": data.get("credits", 0),
-            "userPaygateTier": data.get("userPaygateTier")
-        }
+        # Prefer the stable REST endpoint (same as Flow2API):
+        # GET https://aisandbox-pa.googleapis.com/v1/credits
+        try:
+            url = f"{self.api_base_url}/credits"
+            return await self._make_request(
+                method="GET",
+                url=url,
+                use_at=True,
+                at_token=at,
+            )
+        except Exception:
+            # Backward compatibility for older tRPC endpoint
+            url = f"{self.labs_base_url}/trpc/videoFx.credits"
+            result = await self._make_request(
+                method="POST",
+                url=url,
+                json_data={"json": None},
+                use_at=True,
+                at_token=at,
+            )
+            data = result.get("result", {}).get("data", {}).get("json", {})
+            return {"credits": data.get("credits", 0), "userPaygateTier": data.get("userPaygateTier")}
 
     # ========== Project管理 ==========
 
     async def create_project(self, st: str, project_name: str) -> str:
         """创建新项目,返回project_id"""
-        url = f"{self.labs_base_url}/trpc/projects.createProject"
+        normalized_st = self.normalize_session_token(st)
 
-        json_data = {
-            "json": {
-                "projectName": project_name,
-                "toolName": "PINHOLE"
-            }
-        }
+        # Preferred endpoint (same as Flow2API):
+        # POST /trpc/project.createProject with {projectTitle, toolName}
+        attempts = [
+            (
+                f"{self.labs_base_url}/trpc/project.createProject",
+                {"json": {"projectTitle": project_name, "toolName": "PINHOLE"}},
+                "flow2api",
+            ),
+            (
+                f"{self.labs_base_url}/trpc/projects.createProject",
+                {"json": {"projectName": project_name, "toolName": "PINHOLE"}},
+                "legacy",
+            ),
+        ]
 
-        result = await self._make_request(
-            method="POST",
-            url=url,
-            json_data=json_data,
-            use_st=True,
-            st_token=st
-        )
+        last_error: Exception = None  # type: ignore[assignment]
+        for url, json_data, mode in attempts:
+            try:
+                result = await self._make_request(
+                    method="POST",
+                    url=url,
+                    json_data=json_data,
+                    use_st=True,
+                    st_token=normalized_st,
+                )
 
-        data = result.get("result", {}).get("data", {}).get("json", {})
-        project_id = data.get("projectId")
+                if mode == "flow2api":
+                    project_id = (
+                        result.get("result", {})
+                        .get("data", {})
+                        .get("json", {})
+                        .get("result", {})
+                        .get("projectId")
+                    )
+                else:
+                    data = result.get("result", {}).get("data", {}).get("json", {})
+                    project_id = data.get("projectId")
 
-        if not project_id:
-            raise Exception("创建项目失败: 未获取到projectId")
+                if not project_id:
+                    raise Exception("创建项目失败: 未获取到projectId")
+                return project_id
+            except Exception as e:
+                last_error = e
 
-        return project_id
+        raise last_error
 
     # ========== 图片上传 ==========
 

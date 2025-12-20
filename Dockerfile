@@ -1,6 +1,6 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker.1ms.run/docker/dockerfile:1.7
 
-ARG PYTHON_IMAGE=docker.1ms.run/python:3.11-slim
+ARG PYTHON_IMAGE=docker.1ms.run/python:3.11-slim-bookworm
 FROM ${PYTHON_IMAGE}
 
 ARG APT_DEBIAN_URI=http://deb.debian.org/debian
@@ -28,32 +28,38 @@ WORKDIR /app
 # Install Playwright runtime dependencies (used by Gemini/Flow captcha in browser modes).
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    printf 'Acquire::http::Proxy \"false\";\nAcquire::https::Proxy \"false\";\n' > /etc/apt/apt.conf.d/99disable-proxy \
-    && if [[ -f /etc/apt/sources.list.d/debian.sources ]]; then \
-         sed -i "s|http://deb.debian.org/debian|${APT_DEBIAN_URI}|g" /etc/apt/sources.list.d/debian.sources; \
-         sed -i "s|http://security.debian.org/debian-security|${APT_SECURITY_URI}|g" /etc/apt/sources.list.d/debian.sources; \
-       elif [[ -f /etc/apt/sources.list ]]; then \
-         sed -i "s|http://deb.debian.org/debian|${APT_DEBIAN_URI}|g" /etc/apt/sources.list; \
-         sed -i "s|http://security.debian.org/debian-security|${APT_SECURITY_URI}|g" /etc/apt/sources.list; \
-       fi \
-    && env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY -u http_proxy -u https_proxy -u all_proxy -u no_proxy \
-    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update \
-    && apt-get install -y \
-    libnss3 \
-    libnspr4 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxkbcommon0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxfixes3 \
-    libxrandr2 \
-    libgbm1 \
-    libasound2 \
-    libpango-1.0-0 \
-    libcairo2
+    /bin/sh -euxc '\
+      printf "Acquire::http::Proxy \\"false\\";\\nAcquire::https::Proxy \\"false\\";\\nAcquire::ForceIPv4 \\"true\\";\\n" > /etc/apt/apt.conf.d/99disable-proxy; \
+      if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i "s|https\\?://deb.debian.org/debian|${APT_DEBIAN_URI}|g" /etc/apt/sources.list.d/debian.sources; \
+        sed -i "s|https\\?://security.debian.org/debian-security|${APT_SECURITY_URI}|g" /etc/apt/sources.list.d/debian.sources; \
+      elif [ -f /etc/apt/sources.list ]; then \
+        sed -i "s|https\\?://deb.debian.org/debian|${APT_DEBIAN_URI}|g" /etc/apt/sources.list; \
+        sed -i "s|https\\?://security.debian.org/debian-security|${APT_SECURITY_URI}|g" /etc/apt/sources.list; \
+      fi; \
+      echo "== /etc/apt/sources.list.d/debian.sources =="; \
+      ( [ -f /etc/apt/sources.list.d/debian.sources ] && cat /etc/apt/sources.list.d/debian.sources || true ); \
+      echo "== /etc/apt/sources.list =="; \
+      ( [ -f /etc/apt/sources.list ] && cat /etc/apt/sources.list || true ); \
+      env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY -u http_proxy -u https_proxy -u all_proxy -u no_proxy \
+        apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=10 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 update; \
+      apt-get install -y --no-install-recommends \
+        libnss3 \
+        libnspr4 \
+        libatk1.0-0 \
+        libatk-bridge2.0-0 \
+        libcups2 \
+        libdrm2 \
+        libxkbcommon0 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxfixes3 \
+        libxrandr2 \
+        libgbm1 \
+        libasound2 \
+        libpango-1.0-0 \
+        libcairo2; \
+    '
 
 COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
